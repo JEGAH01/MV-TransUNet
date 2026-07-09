@@ -8,10 +8,13 @@ Components:
 3. Laplacian Boundary Loss
 4. Combined Joint Loss
 
+
 Formula:
 
 L = alpha*BCE + beta*Dice + gamma*Boundary
 
+
+CUDA/Mixed Precision Compatible
 """
 
 
@@ -23,6 +26,8 @@ import torch.nn.functional as F
 
 
 
+
+
 # ============================================================
 # SOFT DICE LOSS
 # ============================================================
@@ -31,103 +36,59 @@ import torch.nn.functional as F
 class SoftDiceLoss(nn.Module):
 
 
-    def __init__(
-
-        self,
-
-        smooth=1e-6
-
-    ):
-
+    def __init__(self, smooth=1e-6):
 
         super().__init__()
-
 
         self.smooth = smooth
 
 
 
-    def forward(
-
-        self,
-
-        prediction,
-
-        target
-
-    ):
+    def forward(self, prediction, target):
 
 
-        prediction = torch.sigmoid(
-
-            prediction
-
-        )
+        prediction = torch.sigmoid(prediction)
 
 
         prediction = prediction.contiguous().view(
-
             prediction.size(0),
-
             -1
-
         )
 
 
         target = target.contiguous().view(
-
             target.size(0),
-
             -1
-
         )
 
 
 
         intersection = torch.sum(
-
             prediction * target,
-
             dim=1
-
         )
-
 
 
         dice = (
-
             2.0 * intersection + self.smooth
-
         ) / (
-
-            torch.sum(prediction,dim=1)
-
+            torch.sum(prediction, dim=1)
             +
-
-            torch.sum(target,dim=1)
-
+            torch.sum(target, dim=1)
             +
-
             self.smooth
-
         )
 
 
-
-        loss = 1 - dice
-
-
-
-        return loss.mean()
+        return (1 - dice).mean()
 
 
 
 
 
 # ============================================================
-# LAPLACIAN BOUNDARY EXTRACTION
+# BOUNDARY EXTRACTION
 # ============================================================
-
 
 
 class BoundaryExtractor(nn.Module):
@@ -135,65 +96,80 @@ class BoundaryExtractor(nn.Module):
 
     def __init__(self):
 
-
         super().__init__()
 
 
 
+        # Laplacian kernel
+
         kernel = torch.tensor(
-
             [
-
                 [
+                    [
+                        0, 1, 0
+                    ],
 
-                    [0,1,0],
+                    [
+                        1, -4, 1
+                    ],
 
-                    [1,-4,1],
-
-                    [0,1,0]
+                    [
+                        0, 1, 0
+                    ]
 
                 ]
-
             ],
 
             dtype=torch.float32
-
         )
+
+
+
+        # Shape:
+        # [out_channels, in_channels, H, W]
+
+        kernel = kernel.unsqueeze(0)
 
 
 
         self.register_buffer(
-
             "kernel",
-
-            kernel.unsqueeze(0)
-
+            kernel
         )
 
 
 
-    def forward(self,x):
+
+
+    def forward(self, x):
+
+
+        # Make kernel same device and dtype
+        # as input tensor
+
+        kernel = self.kernel.to(
+
+            device=x.device,
+
+            dtype=x.dtype
+
+        )
+
 
 
         boundary = F.conv2d(
 
             x,
 
-            self.kernel,
+            kernel,
 
             padding=1
 
         )
 
 
-        boundary = torch.abs(
 
-            boundary
-
-        )
-
-
-        return boundary
+        return torch.abs(boundary)
 
 
 
@@ -204,58 +180,40 @@ class BoundaryExtractor(nn.Module):
 # ============================================================
 
 
-
 class BoundaryLoss(nn.Module):
 
 
     def __init__(self):
 
-
         super().__init__()
-
 
 
         self.extractor = BoundaryExtractor()
 
 
 
-    def forward(
 
-        self,
-
-        prediction,
-
-        target
-
-    ):
-
+    def forward(self, prediction, target):
 
 
         prediction = torch.sigmoid(
-
             prediction
-
         )
 
 
 
         pred_boundary = self.extractor(
-
             prediction
-
         )
-
 
 
         target_boundary = self.extractor(
-
             target
-
         )
 
 
 
-        loss = F.mse_loss(
+        return F.mse_loss(
 
             pred_boundary,
 
@@ -265,16 +223,11 @@ class BoundaryLoss(nn.Module):
 
 
 
-        return loss
-
-
-
 
 
 # ============================================================
-# COMPLETE MV-TRANSUNET JOINT LOSS
+# COMPLETE MV-TRANSUNET LOSS
 # ============================================================
-
 
 
 class MVTransUNetLoss(nn.Module):
@@ -299,9 +252,7 @@ class MVTransUNetLoss(nn.Module):
 
         self.alpha = alpha
 
-
         self.beta = beta
-
 
         self.gamma = gamma
 
@@ -310,25 +261,16 @@ class MVTransUNetLoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()
 
 
-
         self.dice = SoftDiceLoss()
-
 
 
         self.boundary = BoundaryLoss()
 
 
 
-    def forward(
 
-        self,
 
-        prediction,
-
-        target
-
-    ):
-
+    def forward(self, prediction, target):
 
 
         bce_loss = self.bce(
@@ -377,13 +319,25 @@ class MVTransUNetLoss(nn.Module):
 
         return {
 
-            "total_loss": total_loss,
 
-            "bce_loss": bce_loss,
+            "total_loss":
 
-            "dice_loss": dice_loss,
+                total_loss,
 
-            "boundary_loss": boundary_loss
+
+            "bce_loss":
+
+                bce_loss,
+
+
+            "dice_loss":
+
+                dice_loss,
+
+
+            "boundary_loss":
+
+                boundary_loss
 
         }
 
@@ -392,12 +346,25 @@ class MVTransUNetLoss(nn.Module):
 
 
 # ============================================================
-# TEST
+# LOCAL TEST
 # ============================================================
 
 
-
 if __name__ == "__main__":
+
+
+    device = torch.device(
+
+        "cuda"
+
+        if torch.cuda.is_available()
+
+        else
+
+        "cpu"
+
+    )
+
 
 
     prediction = torch.randn(
@@ -408,9 +375,14 @@ if __name__ == "__main__":
 
         256,
 
-        256
+        256,
+
+        device=device,
+
+        requires_grad=True
 
     )
+
 
 
     target = torch.randint(
@@ -429,13 +401,15 @@ if __name__ == "__main__":
 
             256
 
-        )
+        ),
+
+        device=device
 
     ).float()
 
 
 
-    criterion = MVTransUNetLoss()
+    criterion = MVTransUNetLoss().to(device)
 
 
 
@@ -449,7 +423,7 @@ if __name__ == "__main__":
 
 
 
-    for name,value in losses.items():
+    for name, value in losses.items():
 
         print(
 
@@ -458,3 +432,11 @@ if __name__ == "__main__":
             value.item()
 
         )
+
+
+    losses["total_loss"].backward()
+
+
+    print(
+        "Backward pass successful"
+    )
