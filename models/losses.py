@@ -14,14 +14,12 @@ Formula:
 L = alpha*BCE + beta*Dice + gamma*Boundary
 
 
-CUDA/Mixed Precision Compatible
+CUDA / AMP Compatible
 """
 
 
 import torch
-
 import torch.nn as nn
-
 import torch.nn.functional as F
 
 
@@ -70,13 +68,23 @@ class SoftDiceLoss(nn.Module):
 
 
         dice = (
-            2.0 * intersection + self.smooth
-        ) / (
-            torch.sum(prediction, dim=1)
-            +
-            torch.sum(target, dim=1)
+
+            2.0 * intersection
             +
             self.smooth
+
+        ) / (
+
+            torch.sum(prediction, dim=1)
+
+            +
+
+            torch.sum(target, dim=1)
+
+            +
+
+            self.smooth
+
         )
 
 
@@ -100,9 +108,10 @@ class BoundaryExtractor(nn.Module):
 
 
 
-        # Laplacian kernel
+        # Laplacian edge detector
 
         kernel = torch.tensor(
+
             [
                 [
                     [
@@ -121,20 +130,26 @@ class BoundaryExtractor(nn.Module):
             ],
 
             dtype=torch.float32
+
         )
 
 
-
-        # Shape:
-        # [out_channels, in_channels, H, W]
+        # Convert:
+        # [1,3,3]
+        #
+        # to:
+        # [1,1,3,3]
 
         kernel = kernel.unsqueeze(0)
 
 
 
         self.register_buffer(
+
             "kernel",
+
             kernel
+
         )
 
 
@@ -144,7 +159,8 @@ class BoundaryExtractor(nn.Module):
     def forward(self, x):
 
 
-        # Make kernel same device and dtype
+        # IMPORTANT:
+        # Move kernel to same device and dtype
         # as input tensor
 
         kernel = self.kernel.to(
@@ -169,7 +185,15 @@ class BoundaryExtractor(nn.Module):
 
 
 
-        return torch.abs(boundary)
+        boundary = torch.abs(
+
+            boundary
+
+        )
+
+
+
+        return boundary
 
 
 
@@ -193,33 +217,44 @@ class BoundaryLoss(nn.Module):
 
 
 
+
     def forward(self, prediction, target):
 
 
         prediction = torch.sigmoid(
+
             prediction
+
         )
 
 
 
         pred_boundary = self.extractor(
+
             prediction
+
         )
 
 
         target_boundary = self.extractor(
+
             target
+
         )
 
 
 
-        return F.mse_loss(
+        loss = F.mse_loss(
 
             pred_boundary,
 
             target_boundary
 
         )
+
+
+
+        return loss
 
 
 
@@ -270,7 +305,16 @@ class MVTransUNetLoss(nn.Module):
 
 
 
-    def forward(self, prediction, target):
+    def forward(
+
+        self,
+
+        prediction,
+
+        target
+
+    ):
+
 
 
         bce_loss = self.bce(
@@ -282,6 +326,7 @@ class MVTransUNetLoss(nn.Module):
         )
 
 
+
         dice_loss = self.dice(
 
             prediction,
@@ -289,6 +334,7 @@ class MVTransUNetLoss(nn.Module):
             target
 
         )
+
 
 
         boundary_loss = self.boundary(
@@ -367,6 +413,10 @@ if __name__ == "__main__":
 
 
 
+    print("Device:", device)
+
+
+
     prediction = torch.randn(
 
         2,
@@ -423,20 +473,28 @@ if __name__ == "__main__":
 
 
 
-    for name, value in losses.items():
+    print("\nLoss Results")
+
+    print("----------------")
+
+
+
+    for name,value in losses.items():
 
         print(
 
             name,
+
+            ":",
 
             value.item()
 
         )
 
 
+
     losses["total_loss"].backward()
 
 
-    print(
-        "Backward pass successful"
-    )
+
+    print("\nBackward pass successful")
