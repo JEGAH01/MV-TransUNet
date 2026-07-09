@@ -1,0 +1,53 @@
+name: mvtransunet
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+
+  # Python
+  - python=3.10
+
+  # PyTorch GPU
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  # Scientific Computing
+  - numpy
+  - scipy
+  - pandas
+
+  # Image Processing
+  - opencv
+  - scikit-image
+  - pillow
+
+  # Machine Learning
+  - scikit-learn
+
+  # Visualization
+  - matplotlib
+
+  # Utilities
+  - pyyaml
+  - tqdm
+
+  # Jupyter Support
+  - jupyter
+  - notebook
+  - ipykernel
+
+  # Pip Packages
+  - pip
+
+  - pip:
+      - albumentations
+      - timm
+      - einops
+      - tensorboard
+      - grad-cam
