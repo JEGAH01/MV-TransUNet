@@ -5,15 +5,17 @@ Colab GPU Optimized
 
 Features:
 
+- YAML configuration
 - Mixed Precision Training
-- AdamW
-- Cosine Scheduler
-- Gradient Accumulation
-- Gradient Clipping
-- TensorBoard
-- Best Model Saving
-- Last Checkpoint Saving
-- Early Stopping
+- AdamW optimizer
+- Cosine scheduler
+- Gradient accumulation
+- Gradient clipping
+- TensorBoard logging
+- Best model saving
+- Last checkpoint saving
+- Resume training
+- Early stopping
 - Validation Dice
 
 """
@@ -23,13 +25,14 @@ import os
 import random
 import yaml
 
+
 import numpy as np
+
 
 from tqdm import tqdm
 
 
 import torch
-import torch.nn as nn
 
 
 from torch.amp import autocast, GradScaler
@@ -56,12 +59,11 @@ from src.datasets import build_dataloaders
 
 
 # ============================================================
-# SEED
+# RANDOM SEED
 # ============================================================
 
 
 def seed_everything(seed):
-
 
     random.seed(seed)
 
@@ -75,7 +77,6 @@ def seed_everything(seed):
 
 
 
-
 # ============================================================
 # CONFIG
 # ============================================================
@@ -83,8 +84,7 @@ def seed_everything(seed):
 
 def load_config(path):
 
-
-    with open(path,"r") as file:
+    with open(path, "r") as file:
 
         return yaml.safe_load(file)
 
@@ -92,47 +92,34 @@ def load_config(path):
 
 
 
-
-
 # ============================================================
-# DICE
+# DICE SCORE
 # ============================================================
 
 
-def dice_score(
-
-        prediction,
-
-        target,
-
-        threshold=0.5
-
-):
+def dice_score(prediction, target, threshold=0.5):
 
 
-    prediction = torch.sigmoid(prediction)
-
+    prediction = torch.sigmoid(
+        prediction
+    )
 
 
     prediction = (
-
         prediction > threshold
-
     ).float()
 
 
 
     intersection = torch.sum(
-
         prediction * target
-
     )
 
 
 
     dice = (
 
-        2 * intersection + 1e-6
+        2.0 * intersection + 1e-6
 
     ) / (
 
@@ -155,8 +142,6 @@ def dice_score(
 
 
 
-
-
 # ============================================================
 # TRAIN ONE EPOCH
 # ============================================================
@@ -164,19 +149,19 @@ def dice_score(
 
 def train_one_epoch(
 
-        model,
+    model,
 
-        loader,
+    loader,
 
-        criterion,
+    criterion,
 
-        optimizer,
+    optimizer,
 
-        scaler,
+    scaler,
 
-        device,
+    device,
 
-        accumulation_steps
+    accumulation_steps
 
 ):
 
@@ -185,7 +170,6 @@ def train_one_epoch(
 
 
     running_loss = 0.0
-
 
 
     optimizer.zero_grad()
@@ -202,7 +186,7 @@ def train_one_epoch(
 
 
 
-    for step,batch in enumerate(progress):
+    for step, batch in enumerate(progress):
 
 
         images = batch["image"].to(
@@ -226,14 +210,15 @@ def train_one_epoch(
 
         with autocast(
 
-            device_type=device.type,
+            device_type="cuda",
 
-            enabled=device.type=="cuda"
+            enabled=device.type == "cuda"
 
         ):
 
 
             outputs = model(images)
+
 
 
             loss_dict = criterion(
@@ -253,15 +238,23 @@ def train_one_epoch(
 
 
 
+
+
         scaler.scale(loss).backward()
 
 
 
+        # Update weights after accumulation
+
         if (
 
-            step + 1
+            (step + 1) % accumulation_steps == 0
 
-        ) % accumulation_steps == 0:
+            or
+
+            step == len(loader)-1
+
+        ):
 
 
 
@@ -294,6 +287,8 @@ def train_one_epoch(
 
 
 
+
+
         running_loss += loss.item()
 
 
@@ -314,7 +309,6 @@ def train_one_epoch(
 
 
 
-
 # ============================================================
 # VALIDATION
 # ============================================================
@@ -322,13 +316,13 @@ def train_one_epoch(
 
 def validate(
 
-        model,
+    model,
 
-        loader,
+    loader,
 
-        criterion,
+    criterion,
 
-        device
+    device
 
 ):
 
@@ -336,9 +330,10 @@ def validate(
     model.eval()
 
 
-    total_loss = 0
 
-    total_dice = 0
+    total_loss = 0.0
+
+    total_dice = 0.0
 
 
 
@@ -354,14 +349,16 @@ def validate(
         ):
 
 
-            images=batch["image"].to(
+
+            images = batch["image"].to(
 
                 device
 
             )
 
 
-            masks=batch["mask"].to(
+
+            masks = batch["mask"].to(
 
                 device
 
@@ -369,11 +366,11 @@ def validate(
 
 
 
-            outputs=model(images)
+            outputs = model(images)
 
 
 
-            loss_dict=criterion(
+            loss_dict = criterion(
 
                 outputs,
 
@@ -411,25 +408,26 @@ def validate(
 
 
 
-
 # ============================================================
-# CHECKPOINT
+# SAVE CHECKPOINT
 # ============================================================
 
 
 def save_checkpoint(
 
-        model,
+    model,
 
-        optimizer,
+    optimizer,
 
-        scheduler,
+    scheduler,
 
-        epoch,
+    scaler,
 
-        dice,
+    epoch,
 
-        path
+    dice,
+
+    path
 
 ):
 
@@ -439,7 +437,9 @@ def save_checkpoint(
         {
 
 
-            "epoch":epoch,
+            "epoch":
+
+                epoch,
 
 
             "model_state":
@@ -455,6 +455,11 @@ def save_checkpoint(
             "scheduler_state":
 
                 scheduler.state_dict(),
+
+
+            "scaler_state":
+
+                scaler.state_dict(),
 
 
             "dice":
@@ -474,6 +479,74 @@ def save_checkpoint(
 
 
 
+# ============================================================
+# LOAD CHECKPOINT
+# ============================================================
+
+
+def load_checkpoint(
+
+    path,
+
+    model,
+
+    optimizer,
+
+    scheduler,
+
+    scaler,
+
+    device
+
+):
+
+
+    checkpoint = torch.load(
+
+        path,
+
+        map_location=device
+
+    )
+
+
+
+    model.load_state_dict(
+
+        checkpoint["model_state"]
+
+    )
+
+
+    optimizer.load_state_dict(
+
+        checkpoint["optimizer_state"]
+
+    )
+
+
+    scheduler.load_state_dict(
+
+        checkpoint["scheduler_state"]
+
+    )
+
+
+    scaler.load_state_dict(
+
+        checkpoint["scaler_state"]
+
+    )
+
+
+
+    return checkpoint["epoch"], checkpoint["dice"]
+
+
+
+
+
+
 
 # ============================================================
 # MAIN
@@ -481,7 +554,6 @@ def save_checkpoint(
 
 
 def main():
-
 
 
     config = load_config(
@@ -500,7 +572,7 @@ def main():
 
 
 
-    device=torch.device(
+    device = torch.device(
 
         "cuda"
 
@@ -514,9 +586,7 @@ def main():
 
 
 
-    print()
-
-    print("==============================")
+    print("="*60)
 
     print(
 
@@ -526,14 +596,11 @@ def main():
 
     )
 
-    print("==============================")
+    print("="*60)
 
 
 
-
-
-    if device.type=="cuda":
-
+    if device.type == "cuda":
 
         print(
 
@@ -545,26 +612,23 @@ def main():
 
 
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # DATA
-    # ========================================================
+    # --------------------------------------------------------
 
 
-
-    train_loader,val_loader = build_dataloaders(
-
+    train_loader, val_loader = build_dataloaders(
 
 
         image_dir=
 
-        "./datasets_processed/DRIVE/images",
+        config["dataset"]["train_dataset"]["image_dir"],
 
 
 
         mask_dir=
 
-        "./datasets_processed/DRIVE/masks",
+        config["dataset"]["train_dataset"]["mask_dir"],
 
 
 
@@ -590,51 +654,38 @@ def main():
 
 
 
-
-
-    # ========================================================
+    # --------------------------------------------------------
     # MODEL
-    # ========================================================
+    # --------------------------------------------------------
 
 
-
-    model=MVTransUNet(
+    model = MVTransUNet(
 
         pretrained=True
 
-    )
-
-
-
-    model=model.to(device)
+    ).to(device)
 
 
 
 
 
-
-
-    # ========================================================
+    # --------------------------------------------------------
     # LOSS
-    # ========================================================
+    # --------------------------------------------------------
 
 
-
-    criterion=MVTransUNetLoss()
-
+    criterion = MVTransUNetLoss().to(device)
 
 
 
 
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # OPTIMIZER
-    # ========================================================
+    # --------------------------------------------------------
 
 
-
-    optimizer=AdamW(
+    optimizer = AdamW(
 
         model.parameters(),
 
@@ -648,9 +699,7 @@ def main():
 
 
 
-
-
-    scheduler=CosineAnnealingLR(
+    scheduler = CosineAnnealingLR(
 
         optimizer,
 
@@ -662,9 +711,7 @@ def main():
 
 
 
-
-
-    scaler=GradScaler(
+    scaler = GradScaler(
 
         "cuda",
 
@@ -676,21 +723,9 @@ def main():
 
 
 
-
-
-
-    # ========================================================
+    # --------------------------------------------------------
     # LOGGING
-    # ========================================================
-
-
-
-    writer=SummaryWriter(
-
-        config["logging"]["directory"]
-
-    )
-
+    # --------------------------------------------------------
 
 
     os.makedirs(
@@ -703,29 +738,100 @@ def main():
 
 
 
+    writer = SummaryWriter(
 
+        config["logging"]["directory"]
 
-
-
-    best_dice=0
-
-
-    patience=0
+    )
 
 
 
 
 
-    # ========================================================
-    # TRAIN LOOP
-    # ========================================================
+    best_dice = 0.0
 
-
-    epochs=config["training"]["epochs"]
+    patience = 0
 
 
 
-    for epoch in range(epochs):
+    start_epoch = 0
+
+
+
+
+
+    # --------------------------------------------------------
+    # RESUME
+    # --------------------------------------------------------
+
+
+    resume_path = os.path.join(
+
+        config["checkpoint"]["directory"],
+
+        "last_model.pth"
+
+    )
+
+
+
+    if os.path.exists(resume_path):
+
+
+        print(
+
+            "Resuming checkpoint..."
+
+        )
+
+
+        start_epoch, best_dice = load_checkpoint(
+
+            resume_path,
+
+            model,
+
+            optimizer,
+
+            scheduler,
+
+            scaler,
+
+            device
+
+        )
+
+
+
+        print(
+
+            "Resume epoch:",
+
+            start_epoch
+
+        )
+
+
+
+
+
+    # --------------------------------------------------------
+    # TRAINING LOOP
+    # --------------------------------------------------------
+
+
+    epochs = config["training"]["epochs"]
+
+
+
+    for epoch in range(
+
+        start_epoch,
+
+        epochs
+
+    ):
+
 
 
         print()
@@ -738,7 +844,7 @@ def main():
 
 
 
-        train_loss=train_one_epoch(
+        train_loss = train_one_epoch(
 
             model,
 
@@ -758,7 +864,7 @@ def main():
 
 
 
-        val_loss,val_dice=validate(
+        val_loss, val_dice = validate(
 
             model,
 
@@ -776,7 +882,7 @@ def main():
 
 
 
-        lr=optimizer.param_groups[0]["lr"]
+        lr = optimizer.param_groups[0]["lr"]
 
 
 
@@ -791,7 +897,7 @@ def main():
 
         print(
 
-            "Val Loss:",
+            "Validation Loss:",
 
             val_loss
 
@@ -819,7 +925,6 @@ def main():
 
 
 
-
         writer.add_scalar(
 
             "Loss/train",
@@ -831,7 +936,6 @@ def main():
         )
 
 
-
         writer.add_scalar(
 
             "Loss/val",
@@ -841,7 +945,6 @@ def main():
             epoch
 
         )
-
 
 
         writer.add_scalar(
@@ -856,19 +959,6 @@ def main():
 
 
 
-        writer.add_scalar(
-
-            "LR",
-
-            lr,
-
-            epoch
-
-        )
-
-
-
-
 
 
         save_checkpoint(
@@ -878,6 +968,8 @@ def main():
             optimizer,
 
             scheduler,
+
+            scaler,
 
             epoch,
 
@@ -897,15 +989,12 @@ def main():
 
 
 
-
         if val_dice > best_dice:
 
 
+            best_dice = val_dice
 
-            best_dice=val_dice
-
-
-            patience=0
+            patience = 0
 
 
 
@@ -916,6 +1005,8 @@ def main():
                 optimizer,
 
                 scheduler,
+
+                scaler,
 
                 epoch,
 
@@ -932,7 +1023,6 @@ def main():
             )
 
 
-
             print(
 
                 "Saved Best Model"
@@ -944,7 +1034,7 @@ def main():
         else:
 
 
-            patience +=1
+            patience += 1
 
 
 
@@ -953,14 +1043,12 @@ def main():
 
             print(
 
-                "Early stopping"
+                "Early stopping triggered"
 
             )
 
 
             break
-
-
 
 
 
@@ -978,6 +1066,7 @@ def main():
 
     )
 
+
     print(
 
         "Best Dice:",
@@ -990,9 +1079,6 @@ def main():
 
 
 
-
-
-
-if __name__=="__main__":
+if __name__ == "__main__":
 
     main()
