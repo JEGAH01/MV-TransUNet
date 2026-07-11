@@ -276,9 +276,9 @@ loss:
 
   # Joint loss:
   # 0.4 BCE + 0.4 Dice + 0.2 Boundary
-  alpha: 0.4
-
-  beta: 0.4
+  focal_tversky_weight: 0.5
+  boundary_weight: 0.3
+  cldice_weight: 0.2
 
   gamma: 0.2
 
