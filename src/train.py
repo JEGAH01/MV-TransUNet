@@ -223,17 +223,21 @@ def build_training_loaders(
         {},
     )
 
-    image_dir = dataset_config[
+    image_dir = str(
+    dataset_config[
         "train_dataset"
     ][
         "image_dir"
     ]
+    ).strip()
 
-    mask_dir = dataset_config[
+    mask_dir = str(
+        dataset_config[
         "train_dataset"
     ][
         "mask_dir"
     ]
+      ).strip()
 
     image_size = int(
         preprocessing_config[
