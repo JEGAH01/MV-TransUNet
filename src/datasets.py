@@ -11,18 +11,21 @@ Supported datasets:
 
 Features:
 - Automatic image-mask matching
-- Deterministic train-validation splitting
+- Whole-image training and evaluation loaders
+- Patch-based training with vessel-centred oversampling
+- Deterministic image-level train-validation splitting
+- Deterministic grid-based validation patches
 - Separate training and validation transforms
 - CLAHE enhancement
 - Albumentations augmentation
-- PyTorch Dataset and DataLoader
-- Colab GPU optimization
-- Reproducible DataLoader workers
+- Reproducible PyTorch DataLoader workers
 - Cross-dataset evaluation support
+
+Important protocol rule:
+Training and validation are split at IMAGE level before patches are created.
+This prevents patches from the same retinal image appearing in both sets.
 """
 
-
-import os
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -36,597 +39,593 @@ from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset, Subset
 
 
-# ============================================================
-# SUPPORTED IMAGE FORMATS
-# ============================================================
+PathLike = Union[str, Path]
+SamplePair = Tuple[Path, Path]
+
 
 IMAGE_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".tif",
-    ".tiff",
-    ".ppm",
-    ".gif",
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".ppm", ".gif"
 }
 
 
-# ============================================================
-# RANDOM SEED
-# ============================================================
-
 def set_seed(seed: int = 42) -> None:
-    """
-    Set global random seeds.
-    """
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
 
 def seed_worker(worker_id: int) -> None:
-    """
-    Seed each DataLoader worker deterministically.
-    """
-
+    del worker_id
     worker_seed = torch.initial_seed() % (2**32)
-
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
 
-# ============================================================
-# CLAHE ENHANCEMENT
-# ============================================================
-
 class CLAHEEnhancement:
-    """
-    Apply CLAHE to the luminance channel of an RGB image.
-    """
-
-    def __init__(
-        self,
-        clip_limit: float = 2.0,
-        tile_grid_size: int = 8,
-    ) -> None:
+    def __init__(self, clip_limit: float = 2.0, tile_grid_size: int = 8) -> None:
         self.clahe = cv2.createCLAHE(
             clipLimit=float(clip_limit),
-            tileGridSize=(
-                int(tile_grid_size),
-                int(tile_grid_size),
-            ),
+            tileGridSize=(int(tile_grid_size), int(tile_grid_size)),
         )
 
     def __call__(self, image: np.ndarray) -> np.ndarray:
         if image is None:
-            raise ValueError(
-                "CLAHE received an empty image."
-            )
-
+            raise ValueError("CLAHE received an empty image.")
         if image.ndim != 3 or image.shape[2] != 3:
-            raise ValueError(
-                "CLAHE expects an RGB image with three channels."
-            )
-
-        lab_image = cv2.cvtColor(
-            image,
-            cv2.COLOR_RGB2LAB,
-        )
-
-        l_channel, a_channel, b_channel = cv2.split(
-            lab_image
-        )
-
-        enhanced_l_channel = self.clahe.apply(
-            l_channel
-        )
-
-        enhanced_lab = cv2.merge(
-            [
-                enhanced_l_channel,
-                a_channel,
-                b_channel,
-            ]
-        )
-
-        enhanced_rgb = cv2.cvtColor(
-            enhanced_lab,
-            cv2.COLOR_LAB2RGB,
-        )
-
-        return enhanced_rgb
+            raise ValueError("CLAHE expects an RGB image with three channels.")
+        lab_image = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab_image)
+        enhanced_l_channel = self.clahe.apply(l_channel)
+        enhanced_lab = cv2.merge([enhanced_l_channel, a_channel, b_channel])
+        return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
 
 
-# ============================================================
-# AUGMENTATION PIPELINES
-# ============================================================
-
-def get_train_transform(
-    image_size: int = 256,
-) -> A.Compose:
-    """
-    Training augmentation pipeline.
-    """
-
-    return A.Compose(
-        [
-            A.Resize(
-                height=image_size,
-                width=image_size,
-            ),
-
-            A.HorizontalFlip(
-                p=0.5,
-            ),
-
-            A.VerticalFlip(
-                p=0.5,
-            ),
-
-            A.Rotate(
-                limit=30,
-                border_mode=cv2.BORDER_CONSTANT,
-                value=0,
-                mask_value=0,
-                p=0.5,
-            ),
-
-            A.ElasticTransform(
-                alpha=120,
-                sigma=6,
-                border_mode=cv2.BORDER_CONSTANT,
-                value=0,
-                mask_value=0,
-                p=0.3,
-            ),
-
-            A.RandomBrightnessContrast(
-                p=0.5,
-            ),
-
-            A.Normalize(
-                mean=(
-                    0.485,
-                    0.456,
-                    0.406,
-                ),
-                std=(
-                    0.229,
-                    0.224,
-                    0.225,
-                ),
-            ),
-
-            ToTensorV2(),
-        ]
-    )
+def get_train_transform(image_size: int = 256) -> A.Compose:
+    return A.Compose([
+        A.Resize(height=image_size, width=image_size),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.Rotate(
+            limit=30,
+            border_mode=cv2.BORDER_CONSTANT,
+            fill=0,
+            fill_mask=0,
+            p=0.5,
+        ),
+        A.ElasticTransform(
+            alpha=120,
+            sigma=6,
+            border_mode=cv2.BORDER_CONSTANT,
+            fill=0,
+            fill_mask=0,
+            p=0.3,
+        ),
+        A.RandomBrightnessContrast(p=0.5),
+        A.Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        ),
+        ToTensorV2(),
+    ])
 
 
-def get_validation_transform(
-    image_size: int = 256,
-) -> A.Compose:
-    """
-    Validation and test preprocessing pipeline.
-    """
-
-    return A.Compose(
-        [
-            A.Resize(
-                height=image_size,
-                width=image_size,
-            ),
-
-            A.Normalize(
-                mean=(
-                    0.485,
-                    0.456,
-                    0.406,
-                ),
-                std=(
-                    0.229,
-                    0.224,
-                    0.225,
-                ),
-            ),
-
-            ToTensorV2(),
-        ]
-    )
+def get_validation_transform(image_size: int = 256) -> A.Compose:
+    return A.Compose([
+        A.Resize(height=image_size, width=image_size),
+        A.Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        ),
+        ToTensorV2(),
+    ])
 
 
-# ============================================================
-# FILE DISCOVERY
-# ============================================================
-
-def get_files(
-    directory: Union[str, Path],
-) -> List[Path]:
-    """
-    Return all supported image files in a directory.
-    """
-
+def get_files(directory: PathLike) -> List[Path]:
     directory = Path(directory)
-
     if not directory.exists():
-        raise FileNotFoundError(
-            f"Directory not found: {directory.resolve()}"
-        )
-
+        raise FileNotFoundError(f"Directory not found: {directory.resolve()}")
     if not directory.is_dir():
-        raise NotADirectoryError(
-            f"Expected a directory: {directory.resolve()}"
-        )
-
+        raise NotADirectoryError(f"Expected a directory: {directory.resolve()}")
     files = [
-        file
-        for file in directory.iterdir()
-        if (
-            file.is_file()
-            and file.suffix.lower() in IMAGE_EXTENSIONS
-        )
+        file for file in directory.iterdir()
+        if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS
     ]
-
-    return sorted(
-        files,
-        key=lambda path: path.name.lower(),
-    )
+    return sorted(files, key=lambda path: path.name.lower())
 
 
-# ============================================================
-# FILE-NAME NORMALIZATION
-# ============================================================
-
-def normalize_filename(
-    filename: Union[str, Path],
-) -> str:
-    """
-    Normalize dataset-specific image and mask names.
-    """
-
+def normalize_filename(filename: PathLike) -> str:
     name = Path(filename).stem.lower()
-
     replacements = [
-        "_training_mask",
-        "_test_mask",
-        "_training",
-        "_test",
-        "_manual1",
-        "_manual",
-        "_mask",
-        "_1stho",
-        "_2ndho",
-        ".ah",
-        ".vk",
+        "_training_mask", "_test_mask", "_training", "_test",
+        "_manual1", "_manual", "_mask", "_1stho", "_2ndho",
+        ".ah", ".vk",
     ]
-
     for item in replacements:
-        name = name.replace(
-            item,
-            "",
-        )
-
+        name = name.replace(item, "")
     return name.strip()
 
-
-# ============================================================
-# IMAGE-MASK MATCHING
-# ============================================================
 
 def match_image_masks(
     image_files: Sequence[Path],
     mask_files: Sequence[Path],
-) -> List[Tuple[Path, Path]]:
-    """
-    Match images and masks using normalized filenames.
-    """
-
+) -> List[SamplePair]:
     if len(image_files) == 0:
-        raise RuntimeError(
-            "No image files were found."
-        )
-
+        raise RuntimeError("No image files were found.")
     if len(mask_files) == 0:
-        raise RuntimeError(
-            "No mask files were found."
-        )
+        raise RuntimeError("No mask files were found.")
 
     mask_dictionary: Dict[str, Path] = {}
-
     for mask_path in mask_files:
-        key = normalize_filename(
-            mask_path.name
-        )
-
-        # Keep the first matching annotation deterministically.
+        key = normalize_filename(mask_path.name)
         if key not in mask_dictionary:
             mask_dictionary[key] = mask_path
 
-    pairs: List[Tuple[Path, Path]] = []
+    pairs: List[SamplePair] = []
     unmatched_images: List[str] = []
-
     for image_path in image_files:
-        key = normalize_filename(
-            image_path.name
-        )
-
-        mask_path = mask_dictionary.get(
-            key
-        )
-
-        if mask_path is not None:
-            pairs.append(
-                (
-                    image_path,
-                    mask_path,
-                )
-            )
+        key = normalize_filename(image_path.name)
+        mask_path = mask_dictionary.get(key)
+        if mask_path is None:
+            unmatched_images.append(image_path.name)
         else:
-            unmatched_images.append(
-                image_path.name
-            )
+            pairs.append((image_path, mask_path))
 
     if len(pairs) == 0:
-        raise RuntimeError(
-            "No matching image-mask pairs were found."
-        )
-
+        raise RuntimeError("No matching image-mask pairs were found.")
     if unmatched_images:
-        print(
-            f"Warning: {len(unmatched_images)} images "
-            "did not have matching masks."
-        )
-
+        print(f"Warning: {len(unmatched_images)} images did not have matching masks.")
     return pairs
 
 
-# ============================================================
-# RETINAL VESSEL DATASET
-# ============================================================
+def load_sample_pairs(image_dir: PathLike, mask_dir: PathLike) -> List[SamplePair]:
+    return match_image_masks(get_files(image_dir), get_files(mask_dir))
+
+
+def load_rgb_image(image_path: PathLike) -> np.ndarray:
+    image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise RuntimeError(f"Could not read image: {image_path}")
+    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+
+def load_binary_mask(mask_path: PathLike) -> np.ndarray:
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise RuntimeError(f"Could not read mask: {mask_path}")
+    return (mask > 127).astype(np.float32)
+
+
+def apply_transform(
+    image: np.ndarray,
+    mask: np.ndarray,
+    transform: Optional[A.Compose],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if transform is not None:
+        transformed = transform(image=image, mask=mask)
+        image_tensor = transformed["image"]
+        mask_tensor = transformed["mask"]
+    else:
+        image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+        mask_tensor = torch.from_numpy(mask).float()
+
+    if not torch.is_tensor(image_tensor):
+        image_tensor = torch.as_tensor(image_tensor)
+    if not torch.is_tensor(mask_tensor):
+        mask_tensor = torch.as_tensor(mask_tensor)
+
+    image_tensor = image_tensor.float()
+    mask_tensor = mask_tensor.float()
+
+    if mask_tensor.ndim == 2:
+        mask_tensor = mask_tensor.unsqueeze(0)
+    elif mask_tensor.ndim == 3 and mask_tensor.shape[-1] == 1:
+        mask_tensor = mask_tensor.permute(2, 0, 1)
+
+    mask_tensor = (mask_tensor > 0.5).float()
+    return image_tensor, mask_tensor
+
+
+def pad_to_minimum_size(
+    image: np.ndarray,
+    mask: np.ndarray,
+    minimum_height: int,
+    minimum_width: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    height, width = mask.shape
+    pad_bottom = max(0, minimum_height - height)
+    pad_right = max(0, minimum_width - width)
+    if pad_bottom == 0 and pad_right == 0:
+        return image, mask
+
+    image = cv2.copyMakeBorder(
+        image, 0, pad_bottom, 0, pad_right, cv2.BORDER_REFLECT_101
+    )
+    mask = cv2.copyMakeBorder(
+        mask, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=0
+    )
+    return image, mask
+
+
+def crop_patch(
+    image: np.ndarray,
+    mask: np.ndarray,
+    top: int,
+    left: int,
+    patch_height: int,
+    patch_width: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    image_patch = image[top:top + patch_height, left:left + patch_width]
+    mask_patch = mask[top:top + patch_height, left:left + patch_width]
+    if image_patch.shape[:2] != (patch_height, patch_width):
+        raise RuntimeError("Image patch extraction produced an invalid shape.")
+    if mask_patch.shape[:2] != (patch_height, patch_width):
+        raise RuntimeError("Mask patch extraction produced an invalid shape.")
+    return image_patch, mask_patch
+
+
+def center_to_top_left(
+    center_y: int,
+    center_x: int,
+    image_height: int,
+    image_width: int,
+    patch_height: int,
+    patch_width: int,
+) -> Tuple[int, int]:
+    top = int(center_y - patch_height // 2)
+    left = int(center_x - patch_width // 2)
+    top = min(max(top, 0), image_height - patch_height)
+    left = min(max(left, 0), image_width - patch_width)
+    return top, left
+
+
+def generate_grid_positions(
+    image_height: int,
+    image_width: int,
+    patch_height: int,
+    patch_width: int,
+    stride: int,
+) -> List[Tuple[int, int]]:
+    if stride < 1:
+        raise ValueError("Patch stride must be at least 1.")
+
+    max_top = max(0, image_height - patch_height)
+    max_left = max(0, image_width - patch_width)
+
+    top_positions = list(range(0, max_top + 1, stride)) or [0]
+    left_positions = list(range(0, max_left + 1, stride)) or [0]
+
+    if top_positions[-1] != max_top:
+        top_positions.append(max_top)
+    if left_positions[-1] != max_left:
+        left_positions.append(max_left)
+
+    return [(top, left) for top in top_positions for left in left_positions]
+
 
 class RetinalVesselDataset(Dataset):
-    """
-    PyTorch dataset for retinal vessel segmentation.
-    """
+    """Whole-image retinal vessel segmentation dataset."""
 
     def __init__(
         self,
-        image_dir: Union[str, Path],
-        mask_dir: Union[str, Path],
+        image_dir: PathLike,
+        mask_dir: PathLike,
+        transform: Optional[A.Compose] = None,
+        clahe: bool = True,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_grid_size: int = 8,
+        samples: Optional[Sequence[SamplePair]] = None,
+    ) -> None:
+        super().__init__()
+        self.image_dir = Path(image_dir)
+        self.mask_dir = Path(mask_dir)
+        self.transform = transform
+        self.samples = (
+            load_sample_pairs(self.image_dir, self.mask_dir)
+            if samples is None else list(samples)
+        )
+        self.clahe = (
+            CLAHEEnhancement(clahe_clip_limit, clahe_tile_grid_size)
+            if clahe else None
+        )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Dict[str, Union[torch.Tensor, str]]:
+        image_path, mask_path = self.samples[index]
+        image = load_rgb_image(image_path)
+        mask = load_binary_mask(mask_path)
+        if self.clahe is not None:
+            image = self.clahe(image)
+        image_tensor, mask_tensor = apply_transform(image, mask, self.transform)
+        return {
+            "image": image_tensor,
+            "mask": mask_tensor,
+            "image_path": str(image_path),
+            "mask_path": str(mask_path),
+        }
+
+
+class RandomPatchRetinalDataset(Dataset):
+    """Random patch dataset with vessel-centred oversampling."""
+
+    def __init__(
+        self,
+        samples: Sequence[SamplePair],
+        patch_size: Union[int, Tuple[int, int]] = 256,
+        model_input_size: int = 256,
+        patches_per_image: int = 100,
+        vessel_center_probability: float = 0.70,
+        minimum_vessel_fraction: float = 0.01,
+        max_sampling_attempts: int = 20,
         transform: Optional[A.Compose] = None,
         clahe: bool = True,
         clahe_clip_limit: float = 2.0,
         clahe_tile_grid_size: int = 8,
     ) -> None:
         super().__init__()
+        self.samples = list(samples)
+        if len(self.samples) == 0:
+            raise ValueError("RandomPatchRetinalDataset received no samples.")
 
-        self.image_dir = Path(
-            image_dir
+        if isinstance(patch_size, int):
+            self.patch_height = patch_size
+            self.patch_width = patch_size
+        else:
+            self.patch_height, self.patch_width = patch_size
+
+        if self.patch_height < 1 or self.patch_width < 1:
+            raise ValueError("Patch dimensions must be positive.")
+        if patches_per_image < 1:
+            raise ValueError("patches_per_image must be at least 1.")
+        if not 0.0 <= vessel_center_probability <= 1.0:
+            raise ValueError("vessel_center_probability must be between 0 and 1.")
+        if not 0.0 <= minimum_vessel_fraction <= 1.0:
+            raise ValueError("minimum_vessel_fraction must be between 0 and 1.")
+
+        self.model_input_size = int(model_input_size)
+        self.patches_per_image = int(patches_per_image)
+        self.vessel_center_probability = float(vessel_center_probability)
+        self.minimum_vessel_fraction = float(minimum_vessel_fraction)
+        self.max_sampling_attempts = int(max_sampling_attempts)
+        self.transform = transform or get_train_transform(self.model_input_size)
+        self.clahe = (
+            CLAHEEnhancement(clahe_clip_limit, clahe_tile_grid_size)
+            if clahe else None
         )
-
-        self.mask_dir = Path(
-            mask_dir
-        )
-
-        self.transform = transform
-
-        image_files = get_files(
-            self.image_dir
-        )
-
-        mask_files = get_files(
-            self.mask_dir
-        )
-
-        self.samples = match_image_masks(
-            image_files,
-            mask_files,
-        )
-
-        self.clahe = None
-
-        if clahe:
-            self.clahe = CLAHEEnhancement(
-                clip_limit=clahe_clip_limit,
-                tile_grid_size=clahe_tile_grid_size,
-            )
 
     def __len__(self) -> int:
-        return len(
-            self.samples
-        )
+        return len(self.samples) * self.patches_per_image
 
-    def __getitem__(
+    def _sample_random_coordinates(
         self,
-        index: int,
-    ) -> Dict[str, Union[torch.Tensor, str]]:
-        image_path, mask_path = self.samples[index]
+        image_height: int,
+        image_width: int,
+    ) -> Tuple[int, int]:
+        top = int(np.random.randint(0, image_height - self.patch_height + 1))
+        left = int(np.random.randint(0, image_width - self.patch_width + 1))
+        return top, left
 
-        image_bgr = cv2.imread(
-            str(image_path),
-            cv2.IMREAD_COLOR,
+    def _sample_vessel_coordinates(
+        self,
+        mask: np.ndarray,
+    ) -> Optional[Tuple[int, int]]:
+        vessel_coordinates = np.argwhere(mask > 0.5)
+        if vessel_coordinates.shape[0] == 0:
+            return None
+        coordinate_index = int(np.random.randint(0, vessel_coordinates.shape[0]))
+        center_y, center_x = vessel_coordinates[coordinate_index]
+        return center_to_top_left(
+            int(center_y), int(center_x),
+            mask.shape[0], mask.shape[1],
+            self.patch_height, self.patch_width,
         )
 
-        if image_bgr is None:
-            raise RuntimeError(
-                f"Could not read image: {image_path}"
+    def _select_patch(
+        self,
+        image: np.ndarray,
+        mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, bool]:
+        prefer_vessel = np.random.random() < self.vessel_center_probability
+        best_patch: Optional[Tuple[np.ndarray, np.ndarray, bool]] = None
+        best_vessel_fraction = -1.0
+
+        for _ in range(self.max_sampling_attempts):
+            if prefer_vessel:
+                coordinates = self._sample_vessel_coordinates(mask)
+                if coordinates is None:
+                    coordinates = self._sample_random_coordinates(mask.shape[0], mask.shape[1])
+            else:
+                coordinates = self._sample_random_coordinates(mask.shape[0], mask.shape[1])
+
+            top, left = coordinates
+            image_patch, mask_patch = crop_patch(
+                image, mask, top, left, self.patch_height, self.patch_width
             )
+            vessel_fraction = float(mask_patch.mean())
 
-        image = cv2.cvtColor(
-            image_bgr,
-            cv2.COLOR_BGR2RGB,
+            if vessel_fraction > best_vessel_fraction:
+                best_patch = (image_patch, mask_patch, prefer_vessel)
+                best_vessel_fraction = vessel_fraction
+
+            if (not prefer_vessel) or vessel_fraction >= self.minimum_vessel_fraction:
+                return image_patch, mask_patch, prefer_vessel
+
+        if best_patch is None:
+            raise RuntimeError("Patch sampling failed unexpectedly.")
+        return best_patch
+
+    def __getitem__(self, index: int) -> Dict[str, Union[torch.Tensor, str, int, float, bool]]:
+        image_index = (index // self.patches_per_image) % len(self.samples)
+        image_path, mask_path = self.samples[image_index]
+
+        image = load_rgb_image(image_path)
+        mask = load_binary_mask(mask_path)
+        image, mask = pad_to_minimum_size(
+            image, mask, self.patch_height, self.patch_width
         )
-
-        mask = cv2.imread(
-            str(mask_path),
-            cv2.IMREAD_GRAYSCALE,
-        )
-
-        if mask is None:
-            raise RuntimeError(
-                f"Could not read mask: {mask_path}"
-            )
 
         if self.clahe is not None:
-            image = self.clahe(
-                image
-            )
+            image = self.clahe(image)
 
-        mask = (
-            mask > 127
-        ).astype(
-            np.float32
+        image_patch, mask_patch, vessel_centred = self._select_patch(image, mask)
+        vessel_fraction = float(mask_patch.mean())
+        image_tensor, mask_tensor = apply_transform(
+            image_patch, mask_patch, self.transform
         )
-
-        if self.transform is not None:
-            transformed = self.transform(
-                image=image,
-                mask=mask,
-            )
-
-            image_tensor = transformed[
-                "image"
-            ]
-
-            mask_tensor = transformed[
-                "mask"
-            ]
-
-        else:
-            image_tensor = torch.from_numpy(
-                image.transpose(
-                    2,
-                    0,
-                    1,
-                )
-            ).float()
-
-            # Scale unnormalized images to [0, 1].
-            image_tensor = (
-                image_tensor / 255.0
-            )
-
-            mask_tensor = torch.from_numpy(
-                mask
-            ).float()
-
-        if not torch.is_tensor(
-            image_tensor
-        ):
-            image_tensor = torch.as_tensor(
-                image_tensor
-            )
-
-        if not torch.is_tensor(
-            mask_tensor
-        ):
-            mask_tensor = torch.as_tensor(
-                mask_tensor
-            )
-
-        image_tensor = image_tensor.float()
-        mask_tensor = mask_tensor.float()
-
-        if mask_tensor.ndim == 2:
-            mask_tensor = mask_tensor.unsqueeze(
-                0
-            )
-
-        elif (
-            mask_tensor.ndim == 3
-            and mask_tensor.shape[-1] == 1
-        ):
-            mask_tensor = mask_tensor.permute(
-                2,
-                0,
-                1,
-            )
-
-        mask_tensor = (
-            mask_tensor > 0.5
-        ).float()
 
         return {
             "image": image_tensor,
             "mask": mask_tensor,
-            "image_path": str(
-                image_path
-            ),
-            "mask_path": str(
-                mask_path
-            ),
+            "image_path": str(image_path),
+            "mask_path": str(mask_path),
+            "source_image_index": image_index,
+            "patch_index": index,
+            "vessel_fraction": vessel_fraction,
+            "vessel_centred": vessel_centred,
         }
 
 
-# ============================================================
-# DETERMINISTIC SPLIT INDICES
-# ============================================================
+class GridPatchRetinalDataset(Dataset):
+    """Deterministic overlapping validation-patch dataset."""
+
+    def __init__(
+        self,
+        samples: Sequence[SamplePair],
+        patch_size: Union[int, Tuple[int, int]] = 256,
+        model_input_size: int = 256,
+        stride: int = 128,
+        transform: Optional[A.Compose] = None,
+        clahe: bool = True,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_grid_size: int = 8,
+        include_empty_patches: bool = True,
+        minimum_vessel_fraction: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.samples = list(samples)
+        if len(self.samples) == 0:
+            raise ValueError("GridPatchRetinalDataset received no samples.")
+
+        if isinstance(patch_size, int):
+            self.patch_height = patch_size
+            self.patch_width = patch_size
+        else:
+            self.patch_height, self.patch_width = patch_size
+
+        self.model_input_size = int(model_input_size)
+        self.stride = int(stride)
+        self.include_empty_patches = bool(include_empty_patches)
+        self.minimum_vessel_fraction = float(minimum_vessel_fraction)
+        self.transform = transform or get_validation_transform(self.model_input_size)
+        self.clahe = (
+            CLAHEEnhancement(clahe_clip_limit, clahe_tile_grid_size)
+            if clahe else None
+        )
+        self.patch_records: List[Tuple[int, int, int]] = []
+        self._build_patch_records()
+
+    def _build_patch_records(self) -> None:
+        for sample_index, (_, mask_path) in enumerate(self.samples):
+            mask = load_binary_mask(mask_path)
+            dummy_image = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+            dummy_image, mask = pad_to_minimum_size(
+                dummy_image, mask, self.patch_height, self.patch_width
+            )
+            del dummy_image
+
+            positions = generate_grid_positions(
+                mask.shape[0], mask.shape[1],
+                self.patch_height, self.patch_width, self.stride
+            )
+
+            for top, left in positions:
+                mask_patch = mask[
+                    top:top + self.patch_height,
+                    left:left + self.patch_width,
+                ]
+                vessel_fraction = float(mask_patch.mean())
+                if self.include_empty_patches or vessel_fraction >= self.minimum_vessel_fraction:
+                    self.patch_records.append((sample_index, top, left))
+
+        if len(self.patch_records) == 0:
+            raise RuntimeError("No validation patches were generated.")
+
+    def __len__(self) -> int:
+        return len(self.patch_records)
+
+    def __getitem__(self, index: int) -> Dict[str, Union[torch.Tensor, str, int, float]]:
+        sample_index, top, left = self.patch_records[index]
+        image_path, mask_path = self.samples[sample_index]
+
+        image = load_rgb_image(image_path)
+        mask = load_binary_mask(mask_path)
+        image, mask = pad_to_minimum_size(
+            image, mask, self.patch_height, self.patch_width
+        )
+
+        if self.clahe is not None:
+            image = self.clahe(image)
+
+        image_patch, mask_patch = crop_patch(
+            image, mask, top, left, self.patch_height, self.patch_width
+        )
+        vessel_fraction = float(mask_patch.mean())
+        image_tensor, mask_tensor = apply_transform(
+            image_patch, mask_patch, self.transform
+        )
+
+        return {
+            "image": image_tensor,
+            "mask": mask_tensor,
+            "image_path": str(image_path),
+            "mask_path": str(mask_path),
+            "source_image_index": sample_index,
+            "patch_index": index,
+            "top": top,
+            "left": left,
+            "vessel_fraction": vessel_fraction,
+        }
+
 
 def create_split_indices(
     dataset_size: int,
     validation_ratio: float = 0.2,
     seed: int = 42,
 ) -> Tuple[List[int], List[int]]:
-    """
-    Create deterministic training and validation indices.
-    """
-
     if dataset_size < 2:
-        raise ValueError(
-            "At least two samples are required for "
-            "a train-validation split."
-        )
-
+        raise ValueError("At least two images are required for a split.")
     if not 0.0 < validation_ratio < 1.0:
-        raise ValueError(
-            "validation_ratio must be between 0 and 1."
-        )
+        raise ValueError("validation_ratio must be between 0 and 1.")
 
-    validation_size = int(
-        dataset_size * validation_ratio
-    )
-
-    validation_size = max(
-        1,
-        validation_size,
-    )
-
-    validation_size = min(
-        validation_size,
-        dataset_size - 1,
-    )
+    validation_size = int(dataset_size * validation_ratio)
+    validation_size = max(1, validation_size)
+    validation_size = min(validation_size, dataset_size - 1)
 
     generator = torch.Generator()
-    generator.manual_seed(
-        seed
+    generator.manual_seed(seed)
+    shuffled_indices = torch.randperm(dataset_size, generator=generator).tolist()
+
+    validation_indices = shuffled_indices[:validation_size]
+    training_indices = shuffled_indices[validation_size:]
+    return training_indices, validation_indices
+
+
+def split_sample_pairs(
+    samples: Sequence[SamplePair],
+    validation_ratio: float = 0.2,
+    seed: int = 42,
+) -> Tuple[List[SamplePair], List[SamplePair]]:
+    training_indices, validation_indices = create_split_indices(
+        len(samples), validation_ratio, seed
     )
+    training_samples = [samples[index] for index in training_indices]
+    validation_samples = [samples[index] for index in validation_indices]
+    return training_samples, validation_samples
 
-    shuffled_indices = torch.randperm(
-        dataset_size,
-        generator=generator,
-    ).tolist()
-
-    validation_indices = shuffled_indices[
-        :validation_size
-    ]
-
-    training_indices = shuffled_indices[
-        validation_size:
-    ]
-
-    return (
-        training_indices,
-        validation_indices,
-    )
-
-
-# ============================================================
-# DATASET SPLITTING
-# ============================================================
 
 def create_train_validation_split(
     train_dataset: Dataset,
@@ -634,50 +633,15 @@ def create_train_validation_split(
     validation_ratio: float = 0.2,
     seed: int = 42,
 ) -> Tuple[Subset, Subset]:
-    """
-    Split two separate dataset instances using identical indices.
-
-    Separate dataset instances are necessary because training and
-    validation use different transforms.
-    """
-
-    if len(train_dataset) != len(
-        validation_dataset
-    ):
+    if len(train_dataset) != len(validation_dataset):
         raise ValueError(
-            "Training and validation dataset instances "
-            "must contain the same samples."
+            "Training and validation dataset instances must contain the same samples."
         )
-
-    training_indices, validation_indices = (
-        create_split_indices(
-            dataset_size=len(
-                train_dataset
-            ),
-            validation_ratio=validation_ratio,
-            seed=seed,
-        )
+    training_indices, validation_indices = create_split_indices(
+        len(train_dataset), validation_ratio, seed
     )
+    return Subset(train_dataset, training_indices), Subset(validation_dataset, validation_indices)
 
-    training_subset = Subset(
-        train_dataset,
-        training_indices,
-    )
-
-    validation_subset = Subset(
-        validation_dataset,
-        validation_indices,
-    )
-
-    return (
-        training_subset,
-        validation_subset,
-    )
-
-
-# ============================================================
-# DATALOADER CREATION
-# ============================================================
 
 def create_dataloader(
     dataset: Dataset,
@@ -689,39 +653,21 @@ def create_dataloader(
     drop_last: bool = False,
     seed: int = 42,
 ) -> DataLoader:
-    """
-    Create a reproducible PyTorch DataLoader.
-    """
-
     if batch_size < 1:
-        raise ValueError(
-            "batch_size must be at least 1."
-        )
-
+        raise ValueError("batch_size must be at least 1.")
     if num_workers < 0:
-        raise ValueError(
-            "num_workers cannot be negative."
-        )
+        raise ValueError("num_workers cannot be negative.")
 
     generator = torch.Generator()
-    generator.manual_seed(
-        seed
-    )
-
-    use_persistent_workers = (
-        persistent_workers
-        and num_workers > 0
-    )
+    generator.manual_seed(seed)
+    use_persistent_workers = persistent_workers and num_workers > 0
 
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=(
-            pin_memory
-            and torch.cuda.is_available()
-        ),
+        pin_memory=pin_memory and torch.cuda.is_available(),
         persistent_workers=use_persistent_workers,
         drop_last=drop_last,
         worker_init_fn=seed_worker,
@@ -729,13 +675,9 @@ def create_dataloader(
     )
 
 
-# ============================================================
-# TRAIN AND VALIDATION PIPELINE
-# ============================================================
-
 def build_dataloaders(
-    image_dir: Union[str, Path],
-    mask_dir: Union[str, Path],
+    image_dir: PathLike,
+    mask_dir: PathLike,
     image_size: int = 256,
     batch_size: int = 8,
     validation_ratio: float = 0.2,
@@ -746,76 +688,147 @@ def build_dataloaders(
     persistent_workers: bool = False,
     drop_last: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
-    """
-    Build deterministic DRIVE training and validation loaders.
+    """Original whole-image loaders, retained for ablations."""
 
-    The two subsets use separate dataset objects so that:
-    - training keeps augmentation;
-    - validation uses deterministic preprocessing only.
-    """
-
-    training_dataset_full = RetinalVesselDataset(
-        image_dir=image_dir,
-        mask_dir=mask_dir,
-        transform=get_train_transform(
-            image_size=image_size
-        ),
-        clahe=clahe,
+    samples = load_sample_pairs(image_dir, mask_dir)
+    training_samples, validation_samples = split_sample_pairs(
+        samples, validation_ratio, seed
     )
 
-    validation_dataset_full = RetinalVesselDataset(
+    training_dataset = RetinalVesselDataset(
         image_dir=image_dir,
         mask_dir=mask_dir,
-        transform=get_validation_transform(
-            image_size=image_size
-        ),
+        samples=training_samples,
+        transform=get_train_transform(image_size),
         clahe=clahe,
     )
-
-    train_dataset, validation_dataset = (
-        create_train_validation_split(
-            train_dataset=training_dataset_full,
-            validation_dataset=validation_dataset_full,
-            validation_ratio=validation_ratio,
-            seed=seed,
-        )
+    validation_dataset = RetinalVesselDataset(
+        image_dir=image_dir,
+        mask_dir=mask_dir,
+        samples=validation_samples,
+        transform=get_validation_transform(image_size),
+        clahe=clahe,
     )
 
     train_loader = create_dataloader(
-        dataset=train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        drop_last=drop_last,
-        seed=seed,
+        training_dataset, batch_size, True, num_workers,
+        pin_memory, persistent_workers, drop_last, seed
     )
-
     validation_loader = create_dataloader(
-        dataset=validation_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        drop_last=False,
-        seed=seed,
+        validation_dataset, batch_size, False, num_workers,
+        pin_memory, persistent_workers, False, seed
+    )
+    return train_loader, validation_loader
+
+
+def build_patch_dataloaders(
+    image_dir: PathLike,
+    mask_dir: PathLike,
+    patch_size: int = 256,
+    model_input_size: int = 256,
+    patches_per_image: int = 100,
+    validation_stride: int = 128,
+    batch_size: int = 8,
+    validation_ratio: float = 0.2,
+    vessel_center_probability: float = 0.70,
+    minimum_vessel_fraction: float = 0.01,
+    max_sampling_attempts: int = 20,
+    num_workers: int = 2,
+    clahe: bool = True,
+    seed: int = 42,
+    pin_memory: bool = True,
+    persistent_workers: bool = False,
+    drop_last: bool = False,
+    include_empty_validation_patches: bool = True,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Build patch-based training and deterministic validation loaders.
+
+    The image-level split occurs before patch generation, preventing leakage.
+    Suggested first controlled experiment:
+      patch_size=256, model_input_size=256, patches_per_image=100,
+      vessel_center_probability=0.70, validation_stride=128.
+    """
+
+    samples = load_sample_pairs(image_dir, mask_dir)
+    training_samples, validation_samples = split_sample_pairs(
+        samples, validation_ratio, seed
     )
 
-    return (
-        train_loader,
-        validation_loader,
+    training_dataset = RandomPatchRetinalDataset(
+        samples=training_samples,
+        patch_size=patch_size,
+        model_input_size=model_input_size,
+        patches_per_image=patches_per_image,
+        vessel_center_probability=vessel_center_probability,
+        minimum_vessel_fraction=minimum_vessel_fraction,
+        max_sampling_attempts=max_sampling_attempts,
+        transform=get_train_transform(model_input_size),
+        clahe=clahe,
     )
 
+    validation_dataset = GridPatchRetinalDataset(
+        samples=validation_samples,
+        patch_size=patch_size,
+        model_input_size=model_input_size,
+        stride=validation_stride,
+        transform=get_validation_transform(model_input_size),
+        clahe=clahe,
+        include_empty_patches=include_empty_validation_patches,
+        minimum_vessel_fraction=0.0,
+    )
 
-# ============================================================
-# TEST / EVALUATION LOADER
-# ============================================================
+    train_loader = create_dataloader(
+        training_dataset, batch_size, True, num_workers,
+        pin_memory, persistent_workers, drop_last, seed
+    )
+    validation_loader = create_dataloader(
+        validation_dataset, batch_size, False, num_workers,
+        pin_memory, persistent_workers, False, seed
+    )
+    return train_loader, validation_loader
+
+
+def build_all_training_patch_loader(
+    image_dir: PathLike,
+    mask_dir: PathLike,
+    patch_size: int = 256,
+    model_input_size: int = 256,
+    patches_per_image: int = 100,
+    vessel_center_probability: float = 0.70,
+    minimum_vessel_fraction: float = 0.01,
+    max_sampling_attempts: int = 20,
+    batch_size: int = 8,
+    num_workers: int = 2,
+    clahe: bool = True,
+    seed: int = 42,
+    pin_memory: bool = True,
+    persistent_workers: bool = False,
+    drop_last: bool = False,
+) -> DataLoader:
+    """Build a patch loader from all official DRIVE training images."""
+
+    samples = load_sample_pairs(image_dir, mask_dir)
+    dataset = RandomPatchRetinalDataset(
+        samples=samples,
+        patch_size=patch_size,
+        model_input_size=model_input_size,
+        patches_per_image=patches_per_image,
+        vessel_center_probability=vessel_center_probability,
+        minimum_vessel_fraction=minimum_vessel_fraction,
+        max_sampling_attempts=max_sampling_attempts,
+        transform=get_train_transform(model_input_size),
+        clahe=clahe,
+    )
+    return create_dataloader(
+        dataset, batch_size, True, num_workers,
+        pin_memory, persistent_workers, drop_last, seed
+    )
+
 
 def build_test_loader(
-    image_dir: Union[str, Path],
-    mask_dir: Union[str, Path],
+    image_dir: PathLike,
+    mask_dir: PathLike,
     image_size: int = 256,
     batch_size: int = 1,
     num_workers: int = 2,
@@ -823,315 +836,165 @@ def build_test_loader(
     seed: int = 42,
     pin_memory: bool = True,
 ) -> DataLoader:
-    """
-    Build a deterministic test DataLoader.
-    """
-
     dataset = RetinalVesselDataset(
         image_dir=image_dir,
         mask_dir=mask_dir,
-        transform=get_validation_transform(
-            image_size=image_size
-        ),
+        transform=get_validation_transform(image_size),
         clahe=clahe,
     )
-
     return create_dataloader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=False,
-        drop_last=False,
-        seed=seed,
+        dataset, batch_size, False, num_workers,
+        pin_memory, False, False, seed
     )
 
 
-# ============================================================
-# CROSS-DATASET LOADERS
-# ============================================================
-
 def build_cross_dataset_loaders(
-    datasets_config: Union[
-        Sequence[Dict],
-        Dict[str, Dict],
-    ],
+    datasets_config: Union[Sequence[Dict], Dict[str, Dict]],
     image_size: int = 256,
     batch_size: int = 1,
     num_workers: int = 2,
     clahe: bool = True,
     seed: int = 42,
 ) -> Dict[str, DataLoader]:
-    """
-    Build test loaders for STARE, CHASE_DB1, and HRF.
-
-    Supports either:
-    1. A list of dictionaries with a `name` field.
-    2. A dictionary keyed by dataset name.
-    """
-
     loaders: Dict[str, DataLoader] = {}
-
-    if isinstance(
-        datasets_config,
-        dict,
-    ):
+    if isinstance(datasets_config, dict):
         dataset_entries = [
-            {
-                "name": dataset_name,
-                **dataset_config,
-            }
-            for dataset_name, dataset_config
-            in datasets_config.items()
+            {"name": dataset_name, **dataset_config}
+            for dataset_name, dataset_config in datasets_config.items()
         ]
-
     else:
-        dataset_entries = list(
-            datasets_config
-        )
+        dataset_entries = list(datasets_config)
 
     for dataset_config in dataset_entries:
-        name = dataset_config[
-            "name"
-        ]
-
-        print(
-            f"Loading evaluation dataset: {name}"
-        )
-
+        name = dataset_config["name"]
+        print(f"Loading evaluation dataset: {name}")
         loaders[name] = build_test_loader(
-            image_dir=dataset_config[
-                "image_dir"
-            ],
-            mask_dir=dataset_config[
-                "mask_dir"
-            ],
+            image_dir=dataset_config["image_dir"],
+            mask_dir=dataset_config["mask_dir"],
             image_size=image_size,
             batch_size=batch_size,
             num_workers=num_workers,
             clahe=clahe,
             seed=seed,
         )
-
     return loaders
 
 
-# ============================================================
-# DATASET STATISTICS
-# ============================================================
-
-def dataset_statistics(
-    image_dir: Union[str, Path],
-    mask_dir: Union[str, Path],
-) -> Dict[str, int]:
-    """
-    Print and return basic dataset statistics.
-    """
-
-    dataset = RetinalVesselDataset(
-        image_dir=image_dir,
-        mask_dir=mask_dir,
-        transform=None,
-        clahe=False,
-    )
-
+def dataset_statistics(image_dir: PathLike, mask_dir: PathLike) -> Dict[str, int]:
+    samples = load_sample_pairs(image_dir, mask_dir)
     statistics = {
-        "samples": len(
-            dataset
-        ),
-        "images": len(
-            get_files(image_dir)
-        ),
-        "masks": len(
-            get_files(mask_dir)
-        ),
+        "samples": len(samples),
+        "images": len(get_files(image_dir)),
+        "masks": len(get_files(mask_dir)),
     }
-
     print("=" * 60)
     print("Dataset Statistics")
     print("=" * 60)
-    print(
-        "Matched samples:",
-        statistics["samples"],
-    )
-    print(
-        "Image files:",
-        statistics["images"],
-    )
-    print(
-        "Mask files:",
-        statistics["masks"],
-    )
-    print(
-        "Image directory:",
-        Path(image_dir).resolve(),
-    )
-    print(
-        "Mask directory:",
-        Path(mask_dir).resolve(),
-    )
+    print("Matched samples:", statistics["samples"])
+    print("Image files:", statistics["images"])
+    print("Mask files:", statistics["masks"])
+    print("Image directory:", Path(image_dir).resolve())
+    print("Mask directory:", Path(mask_dir).resolve())
     print("=" * 60)
-
     return statistics
 
 
-# ============================================================
-# DATASET VERIFICATION
-# ============================================================
-
 def verify_dataset(
-    image_dir: Union[str, Path],
-    mask_dir: Union[str, Path],
+    image_dir: PathLike,
+    mask_dir: PathLike,
     image_size: int = 256,
 ) -> bool:
-    """
-    Verify that one dataset sample loads correctly.
-    """
-
-    print("\nChecking dataset...")
-
+    print("\nChecking whole-image dataset...")
     try:
         dataset = RetinalVesselDataset(
             image_dir=image_dir,
             mask_dir=mask_dir,
-            transform=get_validation_transform(
-                image_size=image_size
-            ),
+            transform=get_validation_transform(image_size),
             clahe=True,
         )
-
         sample = dataset[0]
-
         print("Dataset OK")
-        print(
-            "Number of samples:",
-            len(dataset),
-        )
-        print(
-            "Image shape:",
-            sample["image"].shape,
-        )
-        print(
-            "Mask shape:",
-            sample["mask"].shape,
-        )
-        print(
-            "Image dtype:",
-            sample["image"].dtype,
-        )
-        print(
-            "Mask dtype:",
-            sample["mask"].dtype,
-        )
-        print(
-            "Mask values:",
-            torch.unique(
-                sample["mask"]
-            ).tolist(),
-        )
-
+        print("Number of samples:", len(dataset))
+        print("Image shape:", sample["image"].shape)
+        print("Mask shape:", sample["mask"].shape)
+        print("Image dtype:", sample["image"].dtype)
+        print("Mask dtype:", sample["mask"].dtype)
+        print("Mask values:", torch.unique(sample["mask"]).tolist())
         return True
-
     except Exception as error:
         print("Dataset Error:")
         print(error)
-
         return False
 
 
-# ============================================================
-# QUICK TEST
-# ============================================================
+def verify_patch_pipeline(
+    image_dir: PathLike,
+    mask_dir: PathLike,
+    patch_size: int = 256,
+    model_input_size: int = 256,
+    patches_per_image: int = 10,
+    validation_stride: int = 128,
+    batch_size: int = 4,
+    validation_ratio: float = 0.2,
+    seed: int = 42,
+) -> bool:
+    print("\nChecking patch pipeline...")
+    try:
+        train_loader, validation_loader = build_patch_dataloaders(
+            image_dir=image_dir,
+            mask_dir=mask_dir,
+            patch_size=patch_size,
+            model_input_size=model_input_size,
+            patches_per_image=patches_per_image,
+            validation_stride=validation_stride,
+            batch_size=batch_size,
+            validation_ratio=validation_ratio,
+            vessel_center_probability=0.70,
+            minimum_vessel_fraction=0.01,
+            num_workers=0,
+            clahe=True,
+            seed=seed,
+        )
+        train_batch = next(iter(train_loader))
+        validation_batch = next(iter(validation_loader))
+        print("Patch pipeline OK")
+        print("Training patch samples:", len(train_loader.dataset))
+        print("Validation patch samples:", len(validation_loader.dataset))
+        print("Training batch image shape:", train_batch["image"].shape)
+        print("Training batch mask shape:", train_batch["mask"].shape)
+        print("Validation batch image shape:", validation_batch["image"].shape)
+        print("Validation batch mask shape:", validation_batch["mask"].shape)
+        print("Training vessel fractions:", train_batch["vessel_fraction"])
+        return True
+    except Exception as error:
+        print("Patch Pipeline Error:")
+        print(error)
+        return False
+
 
 if __name__ == "__main__":
-    print(
-        "MV-TransUNet Dataset Pipeline Test"
-    )
+    print("MV-TransUNet Dataset Pipeline Test")
 
-    test_image_dir = Path(
-        "./datasets_processed/DRIVE/images"
-    )
+    test_image_dir = Path("./datasets_processed/DRIVE/images")
+    test_mask_dir = Path("./datasets_processed/DRIVE/masks")
 
-    test_mask_dir = Path(
-        "./datasets_processed/DRIVE/masks"
-    )
-
-    if (
-        test_image_dir.exists()
-        and test_mask_dir.exists()
-    ):
+    if test_image_dir.exists() and test_mask_dir.exists():
         verify_dataset(
             image_dir=test_image_dir,
             mask_dir=test_mask_dir,
             image_size=256,
         )
-
-        train_loader, validation_loader = (
-            build_dataloaders(
-                image_dir=test_image_dir,
-                mask_dir=test_mask_dir,
-                image_size=256,
-                batch_size=8,
-                validation_ratio=0.2,
-                num_workers=2,
-                clahe=True,
-                seed=42,
-            )
+        verify_patch_pipeline(
+            image_dir=test_image_dir,
+            mask_dir=test_mask_dir,
+            patch_size=256,
+            model_input_size=256,
+            patches_per_image=10,
+            validation_stride=128,
+            batch_size=4,
+            validation_ratio=0.2,
+            seed=42,
         )
-
-        print()
-        print("=" * 60)
-        print("DataLoader Test")
-        print("=" * 60)
-        print(
-            "Training samples:",
-            len(train_loader.dataset),
-        )
-        print(
-            "Validation samples:",
-            len(
-                validation_loader.dataset
-            ),
-        )
-        print(
-            "Training batches:",
-            len(train_loader),
-        )
-        print(
-            "Validation batches:",
-            len(validation_loader),
-        )
-
-        training_batch = next(
-            iter(train_loader)
-        )
-
-        validation_batch = next(
-            iter(validation_loader)
-        )
-
-        print(
-            "Training image batch:",
-            training_batch["image"].shape,
-        )
-        print(
-            "Training mask batch:",
-            training_batch["mask"].shape,
-        )
-        print(
-            "Validation image batch:",
-            validation_batch["image"].shape,
-        )
-        print(
-            "Validation mask batch:",
-            validation_batch["mask"].shape,
-        )
-
     else:
-        print(
-            "Dataset path does not exist."
-        )
-        print(
-            "Run prepare_datasets.py first."
-        )
+        print("Dataset path does not exist.")
+        print("Run prepare_datasets.py first.")
