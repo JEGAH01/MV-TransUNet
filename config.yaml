@@ -13,28 +13,22 @@
 # ============================================================
 
 project:
-
   name: "MV-TransUNet"
-
   version: "1.0"
-
   task: "retinal_vessel_segmentation"
-
   description: >
     Boundary-aware hybrid CNN-Vision Transformer framework
-    for retinal vessel segmentation with emphasis on
-    thin vessel preservation and cross-dataset robustness.
-
+    for retinal vessel segmentation with emphasis on thin-vessel
+    preservation and cross-dataset robustness.
 
 
 # ============================================================
-# RANDOM SEED
+# RANDOMNESS AND REPRODUCIBILITY
 # ============================================================
 
 seed:
-
   value: 42
-
+  deterministic: true
 
 
 # ============================================================
@@ -42,13 +36,12 @@ seed:
 # ============================================================
 
 hardware:
-
   device: "cuda"
-
+  gpu_id: 0
+  accelerator: "google_colab"
+  gpu_type: "Tesla T4"
   mixed_precision: true
-
-  cudnn_benchmark: true
-
+  cudnn_benchmark: false
 
 
 # ============================================================
@@ -56,231 +49,110 @@ hardware:
 # ============================================================
 
 dataset:
+  name: "DRIVE"
 
+  raw_root_dir: "/content/MV-TransUNet/datasets"
+  processed_root_dir: "/content/MV-TransUNet/datasets_processed"
 
-  name: "MultiDataset"
-
-
-  raw_root_dir:
-
-    "/content/MV-TransUNet/datasets"
-
-
-
-  processed_root_dir:
-
-    "/content/MV-TransUNet/datasets_processed"
-
-
-
-  # -------------------------
-  # Training Dataset
-  # -------------------------
+  validation_ratio: 0.2
+  split_seed: 42
 
   train_dataset:
-
-
     name: "DRIVE"
-
-
-    image_dir:
-
-      "/content/MV-TransUNet/datasets_processed/DRIVE/images"
-
-
-    mask_dir:
-
-      "/content/MV-TransUNet/datasets_processed/DRIVE/masks"
-
-
-
-  # -------------------------
-  # Validation Dataset
-  # -------------------------
+    image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/images"
+    mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/masks"
 
   validation_dataset:
-
-
     name: "DRIVE"
-
-
-    image_dir:
-
-      "/content/MV-TransUNet/datasets_processed/DRIVE/images"
-
-
-    mask_dir:
-
-      "/content/MV-TransUNet/datasets_processed/DRIVE/masks"
-
-
-
-  # -------------------------
-  # Additional datasets
-  # Used for cross dataset testing
-  # -------------------------
+    image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/images"
+    mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/masks"
 
   external_datasets:
-
-
     STARE:
-
-      image_dir:
-
-        "/content/MV-TransUNet/datasets_processed/STARE/images"
-
-
-      mask_dir:
-
-        "/content/MV-TransUNet/datasets_processed/STARE/masks"
-
-
+      image_dir: "/content/MV-TransUNet/datasets_processed/STARE/images"
+      mask_dir: "/content/MV-TransUNet/datasets_processed/STARE/masks"
 
     CHASE_DB1:
-
-      image_dir:
-
-        "/content/MV-TransUNet/datasets_processed/CHASE_DB1/images"
-
-
-      mask_dir:
-
-        "/content/MV-TransUNet/datasets_processed/CHASE_DB1/masks"
-
-
+      image_dir: "/content/MV-TransUNet/datasets_processed/CHASE_DB1/images"
+      mask_dir: "/content/MV-TransUNet/datasets_processed/CHASE_DB1/masks"
 
     HRF:
-
-      image_dir:
-
-        "/content/MV-TransUNet/datasets_processed/HRF/images"
-
-
-      mask_dir:
-
-        "/content/MV-TransUNet/datasets_processed/HRF/masks"
-
-
-
+      image_dir: "/content/MV-TransUNet/datasets_processed/HRF/images"
+      mask_dir: "/content/MV-TransUNet/datasets_processed/HRF/masks"
 
 
 # ============================================================
-# PREPROCESSING
+# IMAGE PREPROCESSING
 # ============================================================
 
 preprocessing:
-
-
   image_size:
-
     height: 256
-
     width: 256
 
-
+  channels: 3
 
   clahe:
-
     enabled: true
-
     clip_limit: 2.0
-
     tile_grid_size: 8
 
-
-
   normalization:
-
+    enabled: true
 
     mean:
-
       - 0.485
-
       - 0.456
-
       - 0.406
 
-
     std:
-
       - 0.229
-
       - 0.224
-
       - 0.225
-      # ============================================================
+
+
+# ============================================================
+# DATA AUGMENTATION
+# ============================================================
+
+augmentation:
+  enabled: true
+
+  horizontal_flip:
+    enabled: true
+    probability: 0.5
+
+  vertical_flip:
+    enabled: true
+    probability: 0.5
+
+  rotation:
+    enabled: true
+    limit: 30
+    probability: 0.5
+
+  elastic_transform:
+    enabled: true
+    alpha: 120
+    sigma: 6
+    probability: 0.3
+
+  brightness_contrast:
+    enabled: true
+    probability: 0.5
+
+
+# ============================================================
 # DATALOADER CONFIGURATION
 # ============================================================
 
 dataloader:
-
-
-  batch_size: 4
-
-
+  batch_size: 8
   num_workers: 2
-
-
   pin_memory: true
-
-
   shuffle: true
-
-
-
-# ============================================================
-# AUGMENTATION CONFIGURATION
-# ============================================================
-
-augmentation:
-
-
-  horizontal_flip:
-
-    enabled: true
-
-    probability: 0.5
-
-
-
-  vertical_flip:
-
-    enabled: true
-
-    probability: 0.5
-
-
-
-  rotation:
-
-    enabled: true
-
-    limit: 30
-
-    probability: 0.5
-
-
-
-  elastic_transform:
-
-    enabled: true
-
-    alpha: 120
-
-    sigma: 6
-
-    probability: 0.3
-
-
-
-  brightness_contrast:
-
-    enabled: true
-
-    probability: 0.5
-
-
-
+  drop_last: false
+  persistent_workers: false
 
 
 # ============================================================
@@ -288,63 +160,39 @@ augmentation:
 # ============================================================
 
 model:
+  name: "MV-TransUNet"
 
-
-  name:
-
-    "MV-TransUNet"
-
-
+  input_channels: 3
+  output_channels: 1
 
   backbone:
-
-
-    encoder:
-
-      "resnet50"
-
-
-
-    pretrained:
-
-      true
-
-
+    encoder: "resnet50"
+    pretrained: true
 
   transformer:
+    name: "ViT-B_16"
+    image_size: 256
+    patch_size: 16
+    embed_dim: 768
+    depth: 12
+    heads: 12
+    mlp_dim: 3072
+    dropout: 0.1
 
-
-    embed_dim:
-
-      768
-
-
-    depth:
-
-      12
-
-
-    heads:
-
-      12
-
-
+  vessel_attention:
+    enabled: true
+    reduction_ratio: 16
 
   decoder:
+    type: "multi_scale_progressive"
+    boundary_attention: true
+    use_skip_connections: true
 
-
-    boundary_attention:
-
-      true
-
-
-
-  output_channels:
-
-    1
-
-
-
+    channels:
+      - 512
+      - 256
+      - 128
+      - 64
 
 
 # ============================================================
@@ -352,32 +200,19 @@ model:
 # ============================================================
 
 loss:
+  name: "MVTransUNetLoss"
 
+  alpha: 0.4
+  beta: 0.4
+  gamma: 0.2
 
-  name:
+  bce_weight: 0.4
+  dice_weight: 0.4
+  boundary_weight: 0.2
 
-    "BoundaryAwareLoss"
-
-
-
-  bce_weight:
-
-    1.0
-
-
-
-  dice_weight:
-
-    1.0
-
-
-
-  boundary_weight:
-
-    0.5
-
-
-
+  boundary_loss:
+    type: "laplacian_boundary"
+    kernel_size: 3
 
 
 # ============================================================
@@ -385,34 +220,15 @@ loss:
 # ============================================================
 
 optimizer:
-
-
-  name:
-
-    "AdamW"
-
-
-
-  learning_rate:
-
-    0.0001
-
-
-
-  weight_decay:
-
-    0.0001
-
-
+  name: "AdamW"
+  learning_rate: 0.0001
+  weight_decay: 0.0001
 
   betas:
-
     - 0.9
-
     - 0.999
 
-
-
+  epsilon: 0.00000001
 
 
 # ============================================================
@@ -420,20 +236,8 @@ optimizer:
 # ============================================================
 
 scheduler:
-
-
-  name:
-
-    "CosineAnnealingLR"
-
-
-
-  min_lr:
-
-    0.000001
-
-
-
+  name: "CosineAnnealingLR"
+  min_lr: 0.000001
 
 
 # ============================================================
@@ -441,35 +245,31 @@ scheduler:
 # ============================================================
 
 training:
+  epochs: 150
 
+  gradient_accumulation_steps: 1
 
-  epochs:
-
-    100
-
-
-
-  gradient_accumulation_steps:
-
-    1
-
-
+  gradient_clipping:
+    enabled: true
+    max_norm: 1.0
 
   early_stopping:
+    enabled: true
+    patience: 20
 
 
-    enabled:
+# ============================================================
+# VALIDATION CONFIGURATION
+# ============================================================
 
-      true
+validation:
+  frequency: 1
 
+  metric:
+    name: "dice"
+    mode: "max"
 
-
-    patience:
-
-      20
-
-
-
+  threshold: 0.5
 
 
 # ============================================================
@@ -477,20 +277,16 @@ training:
 # ============================================================
 
 checkpoint:
+  directory: "/content/MV-TransUNet/checkpoints/drive_corrected_baseline"
 
+  resume: false
 
-  directory:
+  save_last: true
+  save_best: true
+  save_best_only: false
 
-    "./checkpoints/drive_corrected_baseline"
-
-
-
-  save_best_only:
-
-    true
-
-
-
+  best_model_name: "best_model.pth"
+  last_model_name: "last_model.pth"
 
 
 # ============================================================
@@ -498,22 +294,13 @@ checkpoint:
 # ============================================================
 
 logging:
-
-
-  directory:
-
-    "/content/MV-TransUNet/logs"
-
-
+  directory: "/content/MV-TransUNet/logs/drive_corrected_baseline"
 
   tensorboard:
+    enabled: true
 
-    enabled:
-
-      true
-
-
-
+  log_learning_rate: true
+  log_loss_components: true
 
 
 # ============================================================
@@ -521,44 +308,25 @@ logging:
 # ============================================================
 
 evaluation:
-
+  threshold: 0.5
 
   metrics:
-
-
     - dice
-
     - sensitivity
-
     - specificity
-
     - accuracy
-
     - auc
-
     - thin_vessel_dice
 
+  thin_vessel_analysis:
+    enabled: true
+    skeletonization: true
+    width_threshold_pixels: 3
 
+  save_predictions: true
 
-  threshold:
-
-    0.5
-
-
-
-  save_predictions:
-
-    true
-
-
-
-  prediction_directory:
-
-
-    "/content/MV-TransUNet/experiments/predictions"
-
-
-
+  prediction_directory: >
+    /content/MV-TransUNet/experiments/drive_corrected_baseline/predictions
 
 
 # ============================================================
@@ -566,15 +334,12 @@ evaluation:
 # ============================================================
 
 experiment:
+  name: "MVTransUNet_DRIVE_Corrected_Baseline"
 
+  output_directory: >
+    /content/MV-TransUNet/experiments/drive_corrected_baseline
 
-  name:
-
-    "MV-TransUNet_T4_training"
-
-
-
-  output_directory:
-
-
-    "/content/MV-TransUNet/experiments"
+  description: >
+    Corrected DRIVE baseline using the official 20-image training set,
+    a fixed 80/20 train-validation split, batch size 8, no gradient
+    accumulation, mixed precision, and boundary-aware joint loss.
