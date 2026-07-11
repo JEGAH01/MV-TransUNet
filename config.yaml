@@ -357,7 +357,7 @@ validation:
 
 checkpoint:
   directory: >
-    /content/MV-TransUNet/checkpoints/drive_512_ds_reduced
+    "/content/MV-TransUNet/checkpoints/drive_patch_256"
 
   # This is a new architecture/training experiment.
   # Do not load checkpoints from the previous 256x256 run.
@@ -380,7 +380,7 @@ checkpoint:
 
 logging:
   directory: >
-    /content/MV-TransUNet/logs/drive_512_ds_reduced
+    "/content/MV-TransUNet/checkpoints/drive_patch_256"
 
   tensorboard:
     enabled: true
@@ -415,7 +415,7 @@ evaluation:
   save_predictions: true
 
   prediction_directory: >
-    /content/MV-TransUNet/experiments/drive_512_ds_reduced/predictions
+    "/content/MV-TransUNet/checkpoints/drive_patch_256/predictions"
 
 
 # ============================================================
@@ -426,7 +426,7 @@ experiment:
   name: "MVTransUNet_DRIVE_512_DS_Reduced"
 
   output_directory: >
-    /content/MV-TransUNet/experiments/drive_512_ds_reduced
+    "/content/MV-TransUNet/checkpoints/drive_patch_256"
 
   description: >
     High-resolution DRIVE experiment using 512x512 retinal images,

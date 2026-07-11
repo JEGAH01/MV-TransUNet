@@ -1,10 +1,13 @@
 """
 MV-TransUNet Training Engine
 
+Patch-Based / Whole-Image Compatible
 Colab GPU Optimized
 
 Features:
 - YAML configuration
+- Whole-image or vessel-centred patch training
+- Deterministic image-level train-validation splitting
 - Mixed precision training
 - AdamW optimizer
 - Cosine annealing scheduler
@@ -18,10 +21,14 @@ Features:
 - Resume training
 - Early stopping
 - Training and validation Dice
+
+Important:
+- Patch training is enabled through `patch_training.enabled` in config.yaml.
+- Image-level splitting occurs before patch extraction, preventing leakage.
+- Whole-image training remains available for controlled ablation studies.
 """
 
 
-import os
 import random
 from pathlib import Path
 from typing import Dict, Tuple
@@ -38,7 +45,10 @@ from tqdm import tqdm
 
 from models.losses import MVTransUNetLoss
 from models.mv_transunet import MVTransUNet
-from src.datasets import build_dataloaders
+from src.datasets import (
+    build_dataloaders,
+    build_patch_dataloaders,
+)
 
 
 # ============================================================
@@ -50,9 +60,7 @@ def seed_everything(
     seed: int,
     deterministic: bool = True,
 ) -> None:
-    """
-    Seed Python, NumPy, and PyTorch for reproducibility.
-    """
+    """Seed Python, NumPy, and PyTorch for reproducibility."""
 
     random.seed(seed)
     np.random.seed(seed)
@@ -78,9 +86,7 @@ def seed_everything(
 def load_config(
     path: str,
 ) -> Dict:
-    """
-    Load the YAML configuration file.
-    """
+    """Load a YAML configuration file."""
 
     config_path = Path(path)
 
@@ -112,9 +118,9 @@ def get_main_output(
     outputs,
 ) -> torch.Tensor:
     """
-    Extract the final segmentation logits.
+    Extract final segmentation logits.
 
-    Training with deep supervision returns a dictionary.
+    Deep-supervision training returns a dictionary.
     Evaluation normally returns a tensor.
     """
 
@@ -130,7 +136,7 @@ def get_main_output(
         return outputs["main_output"]
 
     raise TypeError(
-        "Model output must be a tensor or a dictionary."
+        "Model output must be a tensor or dictionary."
     )
 
 
@@ -145,9 +151,7 @@ def dice_score(
     threshold: float = 0.5,
     smooth: float = 1e-6,
 ) -> torch.Tensor:
-    """
-    Compute the mean Dice score from segmentation logits.
-    """
+    """Compute mean binary Dice from raw segmentation logits."""
 
     probability = torch.sigmoid(
         prediction
@@ -193,6 +197,222 @@ def dice_score(
 
 
 # ============================================================
+# DATA PIPELINE BUILDER
+# ============================================================
+
+
+def build_training_loaders(
+    config: Dict,
+) -> Tuple[
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+    str,
+]:
+    """
+    Build whole-image or patch-based loaders from config.yaml.
+
+    Patch-based mode is selected when:
+        patch_training.enabled: true
+    """
+
+    dataset_config = config["dataset"]
+    dataloader_config = config["dataloader"]
+    preprocessing_config = config["preprocessing"]
+    patch_config = config.get(
+        "patch_training",
+        {},
+    )
+
+    image_dir = dataset_config[
+        "train_dataset"
+    ][
+        "image_dir"
+    ]
+
+    mask_dir = dataset_config[
+        "train_dataset"
+    ][
+        "mask_dir"
+    ]
+
+    image_size = int(
+        preprocessing_config[
+            "image_size"
+        ][
+            "height"
+        ]
+    )
+
+    batch_size = int(
+        dataloader_config[
+            "batch_size"
+        ]
+    )
+
+    validation_ratio = float(
+        dataset_config.get(
+            "validation_ratio",
+            0.2,
+        )
+    )
+
+    split_seed = int(
+        dataset_config.get(
+            "split_seed",
+            config["seed"]["value"],
+        )
+    )
+
+    num_workers = int(
+        dataloader_config.get(
+            "num_workers",
+            2,
+        )
+    )
+
+    clahe_enabled = bool(
+        preprocessing_config.get(
+            "clahe",
+            {},
+        ).get(
+            "enabled",
+            True,
+        )
+    )
+
+    pin_memory = bool(
+        dataloader_config.get(
+            "pin_memory",
+            True,
+        )
+    )
+
+    persistent_workers = bool(
+        dataloader_config.get(
+            "persistent_workers",
+            False,
+        )
+    )
+
+    drop_last = bool(
+        dataloader_config.get(
+            "drop_last",
+            False,
+        )
+    )
+
+    patch_training_enabled = bool(
+        patch_config.get(
+            "enabled",
+            False,
+        )
+    )
+
+    if patch_training_enabled:
+        model_input_size = int(
+            patch_config.get(
+                "model_input_size",
+                image_size,
+            )
+        )
+
+        patch_size = int(
+            patch_config.get(
+                "patch_size",
+                model_input_size,
+            )
+        )
+
+        train_loader, validation_loader = (
+            build_patch_dataloaders(
+                image_dir=image_dir,
+                mask_dir=mask_dir,
+                patch_size=patch_size,
+                model_input_size=model_input_size,
+                patches_per_image=int(
+                    patch_config.get(
+                        "patches_per_image",
+                        100,
+                    )
+                ),
+                validation_stride=int(
+                    patch_config.get(
+                        "validation_stride",
+                        max(
+                            1,
+                            patch_size // 2,
+                        ),
+                    )
+                ),
+                batch_size=batch_size,
+                validation_ratio=validation_ratio,
+                vessel_center_probability=float(
+                    patch_config.get(
+                        "vessel_center_probability",
+                        0.70,
+                    )
+                ),
+                minimum_vessel_fraction=float(
+                    patch_config.get(
+                        "minimum_vessel_fraction",
+                        0.01,
+                    )
+                ),
+                max_sampling_attempts=int(
+                    patch_config.get(
+                        "max_sampling_attempts",
+                        20,
+                    )
+                ),
+                num_workers=num_workers,
+                clahe=clahe_enabled,
+                seed=split_seed,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                drop_last=drop_last,
+                include_empty_validation_patches=bool(
+                    patch_config.get(
+                        "include_empty_validation_patches",
+                        True,
+                    )
+                ),
+            )
+        )
+
+        mode_description = (
+            "patch-based "
+            f"(patch={patch_size}, input={model_input_size})"
+        )
+
+    else:
+        train_loader, validation_loader = (
+            build_dataloaders(
+                image_dir=image_dir,
+                mask_dir=mask_dir,
+                image_size=image_size,
+                batch_size=batch_size,
+                validation_ratio=validation_ratio,
+                num_workers=num_workers,
+                clahe=clahe_enabled,
+                seed=split_seed,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                drop_last=drop_last,
+            )
+        )
+
+        mode_description = (
+            f"whole-image ({image_size}x{image_size})"
+        )
+
+    return (
+        train_loader,
+        validation_loader,
+        mode_description,
+    )
+
+
+# ============================================================
 # TRAIN ONE EPOCH
 # ============================================================
 
@@ -209,10 +429,10 @@ def train_one_epoch(
     gradient_clip_max_norm: float,
 ) -> Dict[str, float]:
     """
-    Train the model for one epoch.
+    Train for one epoch.
 
-    The real loss is reported and logged.
-    Only the backward loss is divided for gradient accumulation.
+    The real loss is reported.
+    Only the backward loss is divided for accumulation.
     """
 
     if accumulation_steps < 1:
@@ -277,13 +497,13 @@ def train_one_epoch(
                 "total_loss"
             ]
 
-            scaled_loss = (
+            backward_loss = (
                 total_loss
                 / accumulation_steps
             )
 
         scaler.scale(
-            scaled_loss
+            backward_loss
         ).backward()
 
         should_update = (
@@ -386,32 +606,26 @@ def train_one_epoch(
             running_total_loss
             / number_of_batches
         ),
-
         "main_loss": (
             running_main_loss
             / number_of_batches
         ),
-
         "auxiliary_loss": (
             running_auxiliary_loss
             / number_of_batches
         ),
-
         "bce_loss": (
             running_bce_loss
             / number_of_batches
         ),
-
         "dice_loss": (
             running_dice_loss
             / number_of_batches
         ),
-
         "boundary_loss": (
             running_boundary_loss
             / number_of_batches
         ),
-
         "dice": (
             running_dice_score
             / number_of_batches
@@ -430,11 +644,7 @@ def validate(
     criterion: torch.nn.Module,
     device: torch.device,
 ) -> Dict[str, float]:
-    """
-    Evaluate the model on the validation split.
-
-    In evaluation mode, MV-TransUNet returns only the final output.
-    """
+    """Evaluate the model on validation images or grid patches."""
 
     if len(loader) == 0:
         raise RuntimeError(
@@ -559,32 +769,26 @@ def validate(
             running_total_loss
             / number_of_batches
         ),
-
         "main_loss": (
             running_main_loss
             / number_of_batches
         ),
-
         "auxiliary_loss": (
             running_auxiliary_loss
             / number_of_batches
         ),
-
         "bce_loss": (
             running_bce_loss
             / number_of_batches
         ),
-
         "dice_loss": (
             running_dice_loss
             / number_of_batches
         ),
-
         "boundary_loss": (
             running_boundary_loss
             / number_of_batches
         ),
-
         "dice": (
             running_dice_score
             / number_of_batches
@@ -593,7 +797,7 @@ def validate(
 
 
 # ============================================================
-# SAVE CHECKPOINT
+# CHECKPOINTS
 # ============================================================
 
 
@@ -607,9 +811,7 @@ def save_checkpoint(
     patience_counter: int,
     path: str,
 ) -> None:
-    """
-    Save the complete training state.
-    """
+    """Save complete training state."""
 
     checkpoint_path = Path(
         path
@@ -620,25 +822,18 @@ def save_checkpoint(
         exist_ok=True,
     )
 
-    checkpoint = {
-        "epoch": epoch,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict(),
-        "scaler_state": scaler.state_dict(),
-        "best_dice": best_dice,
-        "patience_counter": patience_counter,
-    }
-
     torch.save(
-        checkpoint,
+        {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict(),
+            "best_dice": best_dice,
+            "patience_counter": patience_counter,
+        },
         checkpoint_path,
     )
-
-
-# ============================================================
-# LOAD CHECKPOINT
-# ============================================================
 
 
 def load_checkpoint(
@@ -650,12 +845,10 @@ def load_checkpoint(
     device: torch.device,
 ) -> Tuple[int, float, int]:
     """
-    Restore model and training states.
+    Restore complete training state.
 
     Returns:
-        next_epoch,
-        best_dice,
-        patience_counter
+        next_epoch, best_dice, patience_counter
     """
 
     checkpoint = torch.load(
@@ -702,12 +895,8 @@ def load_checkpoint(
         )
     )
 
-    next_epoch = (
-        saved_epoch + 1
-    )
-
     return (
-        next_epoch,
+        saved_epoch + 1,
         best_dice,
         patience_counter,
     )
@@ -728,9 +917,7 @@ def main() -> None:
     )
 
     deterministic = bool(
-        config[
-            "seed"
-        ].get(
+        config["seed"].get(
             "deterministic",
             True,
         )
@@ -749,7 +936,7 @@ def main() -> None:
     )
 
     print("=" * 70)
-    print("MV-TransUNet Deep-Supervision Training")
+    print("MV-TransUNet Training")
     print("=" * 70)
     print(
         "Device:",
@@ -771,126 +958,70 @@ def main() -> None:
     # DATA
     # --------------------------------------------------------
 
-    train_loader, validation_loader = build_dataloaders(
-        image_dir=config[
-            "dataset"
-        ][
-            "train_dataset"
-        ][
-            "image_dir"
-        ],
-
-        mask_dir=config[
-            "dataset"
-        ][
-            "train_dataset"
-        ][
-            "mask_dir"
-        ],
-
-        image_size=int(
-            config[
-                "preprocessing"
-            ][
-                "image_size"
-            ][
-                "height"
-            ]
-        ),
-
-        batch_size=int(
-            config[
-                "dataloader"
-            ][
-                "batch_size"
-            ]
-        ),
-
-        validation_ratio=float(
-            config[
-                "dataset"
-            ][
-                "validation_ratio"
-            ]
-        ),
-
-        num_workers=int(
-            config[
-                "dataloader"
-            ][
-                "num_workers"
-            ]
-        ),
-
-        clahe=bool(
-            config[
-                "preprocessing"
-            ][
-                "clahe"
-            ][
-                "enabled"
-            ]
-        ),
-
-        seed=int(
-            config[
-                "dataset"
-            ][
-                "split_seed"
-            ]
-        ),
-
-        pin_memory=bool(
-            config[
-                "dataloader"
-            ].get(
-                "pin_memory",
-                True,
-            )
-        ),
-
-        persistent_workers=bool(
-            config[
-                "dataloader"
-            ].get(
-                "persistent_workers",
-                False,
-            )
-        ),
-
-        drop_last=bool(
-            config[
-                "dataloader"
-            ].get(
-                "drop_last",
-                False,
-            )
-        ),
+    (
+        train_loader,
+        validation_loader,
+        data_mode,
+    ) = build_training_loaders(
+        config
     )
 
     print()
     print("Dataset summary")
     print("-" * 70)
-
+    print(
+        "Training mode:",
+        data_mode,
+    )
     print(
         "Training samples:",
         len(train_loader.dataset),
     )
-
     print(
         "Validation samples:",
         len(validation_loader.dataset),
     )
-
     print(
         "Training batches:",
         len(train_loader),
     )
-
     print(
         "Validation batches:",
         len(validation_loader),
     )
+
+    patch_config = config.get(
+        "patch_training",
+        {},
+    )
+
+    if bool(
+        patch_config.get(
+            "enabled",
+            False,
+        )
+    ):
+        print(
+            "Patches per source image:",
+            patch_config.get(
+                "patches_per_image",
+                100,
+            ),
+        )
+        print(
+            "Vessel-centred probability:",
+            patch_config.get(
+                "vessel_center_probability",
+                0.70,
+            ),
+        )
+        print(
+            "Minimum vessel fraction:",
+            patch_config.get(
+                "minimum_vessel_fraction",
+                0.01,
+            ),
+        )
 
     # --------------------------------------------------------
     # MODEL
@@ -898,17 +1029,17 @@ def main() -> None:
 
     model_config = config.get(
         "model",
-        {}
+        {},
     )
 
     backbone_config = model_config.get(
         "backbone",
-        {}
+        {},
     )
 
     deep_supervision_config = model_config.get(
         "deep_supervision",
-        {}
+        {},
     )
 
     deep_supervision_enabled = bool(
@@ -925,7 +1056,6 @@ def main() -> None:
                 True,
             )
         ),
-
         transformer_channels=int(
             model_config.get(
                 "transformer",
@@ -935,7 +1065,6 @@ def main() -> None:
                 768,
             )
         ),
-
         vessel_reduction_ratio=int(
             model_config.get(
                 "vessel_attention",
@@ -945,14 +1074,12 @@ def main() -> None:
                 16,
             )
         ),
-
         output_channels=int(
             model_config.get(
                 "output_channels",
                 1,
             )
         ),
-
         deep_supervision=deep_supervision_enabled,
     ).to(device)
 
@@ -962,7 +1089,7 @@ def main() -> None:
 
     loss_config = config.get(
         "loss",
-        {}
+        {},
     )
 
     auxiliary_weights = tuple(
@@ -983,31 +1110,27 @@ def main() -> None:
                 0.4,
             )
         ),
-
         beta=float(
             loss_config.get(
                 "beta",
                 0.4,
             )
         ),
-
         gamma=float(
             loss_config.get(
                 "gamma",
                 0.2,
             )
         ),
-
         auxiliary_weights=auxiliary_weights,
     ).to(device)
 
     # --------------------------------------------------------
-    # OPTIMIZER
+    # OPTIMIZER AND SCHEDULER
     # --------------------------------------------------------
 
     optimizer = AdamW(
         model.parameters(),
-
         lr=float(
             config[
                 "optimizer"
@@ -1015,7 +1138,6 @@ def main() -> None:
                 "learning_rate"
             ]
         ),
-
         weight_decay=float(
             config[
                 "optimizer"
@@ -1023,7 +1145,6 @@ def main() -> None:
                 "weight_decay"
             ]
         ),
-
         betas=tuple(
             config[
                 "optimizer"
@@ -1033,6 +1154,14 @@ def main() -> None:
                     0.9,
                     0.999,
                 ],
+            )
+        ),
+        eps=float(
+            config[
+                "optimizer"
+            ].get(
+                "epsilon",
+                1e-8,
             )
         ),
     )
@@ -1047,9 +1176,7 @@ def main() -> None:
 
     scheduler = CosineAnnealingLR(
         optimizer,
-
         T_max=epochs,
-
         eta_min=float(
             config.get(
                 "scheduler",
@@ -1120,6 +1247,18 @@ def main() -> None:
         )
     )
 
+    validation_threshold = float(
+        config.get(
+            "validation",
+            {},
+        ).get(
+            "threshold",
+            0.5,
+        )
+    )
+
+    del validation_threshold
+
     # --------------------------------------------------------
     # DIRECTORIES AND LOGGING
     # --------------------------------------------------------
@@ -1159,12 +1298,10 @@ def main() -> None:
     print()
     print("Training configuration")
     print("-" * 70)
-
     print(
         "Epochs:",
         epochs,
     )
-
     print(
         "Batch size:",
         config[
@@ -1173,22 +1310,29 @@ def main() -> None:
             "batch_size"
         ],
     )
-
     print(
         "Gradient accumulation:",
         accumulation_steps,
     )
-
+    print(
+        "Effective batch size:",
+        int(
+            config[
+                "dataloader"
+            ][
+                "batch_size"
+            ]
+        )
+        * accumulation_steps,
+    )
     print(
         "Deep supervision:",
         deep_supervision_enabled,
     )
-
     print(
         "Auxiliary weights:",
         auxiliary_weights,
     )
-
     print(
         "Checkpoint directory:",
         checkpoint_directory,
@@ -1260,7 +1404,6 @@ def main() -> None:
             "Next epoch:",
             start_epoch + 1,
         )
-
         print(
             "Best Dice:",
             best_dice,
@@ -1277,11 +1420,9 @@ def main() -> None:
         ):
             print()
             print("=" * 70)
-
             print(
                 f"Epoch {epoch + 1}/{epochs}"
             )
-
             print("=" * 70)
 
             train_metrics = train_one_epoch(
@@ -1316,37 +1457,30 @@ def main() -> None:
             print()
             print("Epoch results")
             print("-" * 70)
-
             print(
                 "Train total loss:",
                 f"{train_metrics['total_loss']:.6f}",
             )
-
             print(
                 "Train main loss:",
                 f"{train_metrics['main_loss']:.6f}",
             )
-
             print(
                 "Train auxiliary loss:",
                 f"{train_metrics['auxiliary_loss']:.6f}",
             )
-
             print(
                 "Train Dice:",
                 f"{train_metrics['dice']:.6f}",
             )
-
             print(
                 "Validation loss:",
                 f"{validation_metrics['total_loss']:.6f}",
             )
-
             print(
                 "Validation Dice:",
                 f"{validation_metrics['dice']:.6f}",
             )
-
             print(
                 "Learning rate:",
                 f"{learning_rate:.10f}",
@@ -1363,7 +1497,6 @@ def main() -> None:
                 ],
                 epoch,
             )
-
             writer.add_scalar(
                 "Loss/train_main",
                 train_metrics[
@@ -1371,7 +1504,6 @@ def main() -> None:
                 ],
                 epoch,
             )
-
             writer.add_scalar(
                 "Loss/train_auxiliary",
                 train_metrics[
@@ -1379,7 +1511,6 @@ def main() -> None:
                 ],
                 epoch,
             )
-
             writer.add_scalar(
                 "Loss/train_bce",
                 train_metrics[
@@ -1387,7 +1518,6 @@ def main() -> None:
                 ],
                 epoch,
             )
-
             writer.add_scalar(
                 "Loss/train_dice",
                 train_metrics[
@@ -1395,7 +1525,6 @@ def main() -> None:
                 ],
                 epoch,
             )
-
             writer.add_scalar(
                 "Loss/train_boundary",
                 train_metrics[
@@ -1403,7 +1532,6 @@ def main() -> None:
                 ],
                 epoch,
             )
-
             writer.add_scalar(
                 "Dice/train",
                 train_metrics[
@@ -1419,7 +1547,27 @@ def main() -> None:
                 ],
                 epoch,
             )
-
+            writer.add_scalar(
+                "Loss/validation_bce",
+                validation_metrics[
+                    "bce_loss"
+                ],
+                epoch,
+            )
+            writer.add_scalar(
+                "Loss/validation_dice",
+                validation_metrics[
+                    "dice_loss"
+                ],
+                epoch,
+            )
+            writer.add_scalar(
+                "Loss/validation_boundary",
+                validation_metrics[
+                    "boundary_loss"
+                ],
+                epoch,
+            )
             writer.add_scalar(
                 "Dice/validation",
                 validation_metrics[
@@ -1427,7 +1575,6 @@ def main() -> None:
                 ],
                 epoch,
             )
-
             writer.add_scalar(
                 "LearningRate",
                 learning_rate,
@@ -1453,9 +1600,7 @@ def main() -> None:
                 best_dice = (
                     current_validation_dice
                 )
-
                 patience_counter = 0
-
             else:
                 patience_counter += 1
 
@@ -1501,7 +1646,6 @@ def main() -> None:
                 print(
                     "Early stopping triggered."
                 )
-
                 break
 
     finally:
@@ -1511,7 +1655,6 @@ def main() -> None:
     print("=" * 70)
     print("Training complete")
     print("=" * 70)
-
     print(
         "Best validation Dice:",
         f"{best_dice:.6f}",
