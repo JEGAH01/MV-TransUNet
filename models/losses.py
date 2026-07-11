@@ -1,795 +1,1052 @@
 """
-MV-TransUNet Boundary-Aware Deep-Supervision Losses
+MV-TransUNet Experiment B Loss Functions
 
-Components:
-1. Binary Cross-Entropy Loss
-2. Soft Dice Loss
-3. Laplacian Boundary Loss
-4. Boundary-Aware Joint Loss
-5. Multi-Scale Deep-Supervision Loss
+Experiment B:
+Focal Tversky Loss
++
+Boundary Loss
++
+clDice Topology Loss
++
+Deep Supervision
 
-Single-output formulation:
 
-    L_joint =
-        alpha * L_BCE
-        + beta * L_Dice
-        + gamma * L_Boundary
+Designed for:
+Retinal Vessel Segmentation
 
-Deep-supervision formulation:
 
-    L_total =
-        L_main
-        + w1 * L_aux1
-        + w2 * L_aux2
-        + w3 * L_aux3
+Purpose:
+Improve:
+- thin vessel recall
+- vessel connectivity
+- topology preservation
+- class imbalance handling
 
-Default auxiliary weights:
 
-    w1 = 0.10
-    w2 = 0.20
-    w3 = 0.30
+Formula:
 
-Features:
-- CUDA compatible
-- Automatic mixed-precision compatible
-- Supports normal tensor predictions
-- Supports deep-supervision dictionaries
-- Validates output and target shapes
-- Reports main and auxiliary loss components
+Main Loss:
+
+L =
+0.5 * FocalTversky
++
+0.3 * Boundary
++
+0.2 * clDice
+
+
+Deep Supervision:
+
+Total =
+Main
++
+0.1 Aux1
++
+0.2 Aux2
++
+0.3 Aux3
+
+
+AMP / CUDA Compatible
 """
 
 
-from typing import Dict, List, Sequence, Tuple, Union
-
 import torch
+
 import torch.nn as nn
+
 import torch.nn.functional as F
 
+from typing import Dict, Tuple
+
+
+
+
 
 # ============================================================
-# TYPE DEFINITIONS
+# FOCAL TVERSKY LOSS
 # ============================================================
 
-PredictionType = Union[
-    torch.Tensor,
-    Dict[
-        str,
-        Union[
-            torch.Tensor,
-            List[torch.Tensor],
-        ],
-    ],
-]
+
+class FocalTverskyLoss(nn.Module):
+    """
+    Focal Tversky Loss
+
+    Designed for highly imbalanced segmentation.
+
+    Penalizes false negatives more heavily.
+
+    Useful for:
+    - thin vessels
+    - micro vessels
+    - small structures
+
+
+    Formula:
+
+    Tversky =
+        TP /
+        (TP + alpha*FP + beta*FN)
+
+
+    Focal:
+
+    (1 - Tversky)^gamma
+    """
+
+
+    def __init__(
+        self,
+        alpha=0.3,
+        beta=0.7,
+        gamma=0.75,
+        smooth=1e-6,
+    ):
+
+        super().__init__()
+
+        self.alpha = alpha
+
+        self.beta = beta
+
+        self.gamma = gamma
+
+        self.smooth = smooth
+
+
+
+    def forward(
+        self,
+        prediction,
+        target,
+    ):
+
+
+        prediction = torch.sigmoid(
+            prediction
+        )
+
+
+        prediction = prediction.contiguous().view(
+            prediction.size(0),
+            -1
+        )
+
+
+        target = target.contiguous().view(
+            target.size(0),
+            -1
+        )
+
+
+
+        true_positive = torch.sum(
+            prediction * target,
+            dim=1,
+        )
+
+
+        false_positive = torch.sum(
+            prediction * (1 - target),
+            dim=1,
+        )
+
+
+        false_negative = torch.sum(
+            (1 - prediction) * target,
+            dim=1,
+        )
+
+
+
+        tversky = (
+
+            true_positive
+            +
+            self.smooth
+
+        ) / (
+
+            true_positive
+
+            +
+
+            self.alpha * false_positive
+
+            +
+
+            self.beta * false_negative
+
+            +
+
+            self.smooth
+
+        )
+
+
+
+        focal_tversky = torch.pow(
+            1 - tversky,
+            self.gamma
+        )
+
+
+        return focal_tversky.mean()
+
+
+
+
+
 
 
 # ============================================================
 # SOFT DICE LOSS
 # ============================================================
 
+
 class SoftDiceLoss(nn.Module):
     """
-    Differentiable Dice loss operating on segmentation logits.
+    Kept for logging compatibility.
+
+    Used as a metric component.
     """
+
 
     def __init__(
         self,
-        smooth: float = 1e-6,
-    ) -> None:
+        smooth=1e-6,
+    ):
+
         super().__init__()
 
-        if smooth <= 0:
-            raise ValueError(
-                "smooth must be greater than zero."
-            )
+        self.smooth = smooth
 
-        self.smooth = float(smooth)
+
 
     def forward(
         self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Calculate mean soft Dice loss across the batch.
+        prediction,
+        target,
+    ):
 
-        Args:
-            prediction:
-                Raw segmentation logits with shape [B, C, H, W].
 
-            target:
-                Binary ground-truth mask with shape [B, C, H, W].
-        """
-
-        if prediction.shape != target.shape:
-            raise ValueError(
-                "SoftDiceLoss shape mismatch: "
-                f"prediction={tuple(prediction.shape)}, "
-                f"target={tuple(target.shape)}."
-            )
-
-        probability = torch.sigmoid(
+        prediction = torch.sigmoid(
             prediction
         )
 
-        probability = probability.contiguous().reshape(
-            probability.size(0),
-            -1,
+
+        prediction = prediction.contiguous().view(
+            prediction.size(0),
+            -1
         )
 
-        target = target.contiguous().reshape(
+
+        target = target.contiguous().view(
             target.size(0),
-            -1,
+            -1
         )
+
+
 
         intersection = torch.sum(
-            probability * target,
+            prediction * target,
             dim=1,
         )
 
-        probability_sum = torch.sum(
-            probability,
-            dim=1,
-        )
 
-        target_sum = torch.sum(
-            target,
-            dim=1,
-        )
 
         dice = (
+
             2.0 * intersection
-            + self.smooth
+
+            +
+
+            self.smooth
+
         ) / (
-            probability_sum
-            + target_sum
-            + self.smooth
+
+            torch.sum(
+                prediction,
+                dim=1
+            )
+
+            +
+
+            torch.sum(
+                target,
+                dim=1
+            )
+
+            +
+
+            self.smooth
+
         )
 
+
+
         return (
-            1.0 - dice
+            1 - dice
         ).mean()
 
 
+
+
+
+
+
 # ============================================================
-# LAPLACIAN BOUNDARY EXTRACTION
+# DIFFERENTIABLE SKELETONIZATION
 # ============================================================
+
+
+def soft_erode(
+    img,
+):
+
+    p1 = -F.max_pool2d(
+        -img,
+        kernel_size=(3,1),
+        stride=(1,1),
+        padding=(1,0),
+    )
+
+
+    p2 = -F.max_pool2d(
+        -img,
+        kernel_size=(1,3),
+        stride=(1,1),
+        padding=(0,1),
+    )
+
+
+    return torch.min(
+        p1,
+        p2,
+    )
+
+
+
+
+def soft_dilate(
+    img,
+):
+
+    return F.max_pool2d(
+        img,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    )
+
+
+
+
+def soft_open(
+    img,
+):
+
+    return soft_dilate(
+        soft_erode(img)
+    )
+
+
+
+
+def soft_skeletonize(
+    img,
+        iterations=10,
+):
+
+    skeleton = F.relu(
+        img - soft_open(img)
+    )
+
+
+    for _ in range(iterations):
+
+        img = soft_erode(
+            img
+        )
+
+        opened = soft_open(
+            img
+        )
+
+        delta = F.relu(
+            img - opened
+        )
+
+        skeleton = skeleton + (
+            (1 - skeleton)
+            *
+            delta
+        )
+
+
+    return skeleton
+
+
+
+
+
+
+
+# ============================================================
+# SOFT CLDICE LOSS
+# ============================================================
+
+
+class SoftCLDiceLoss(nn.Module):
+    """
+    Topology-aware centerline Dice loss.
+
+    Improves:
+    - vessel continuity
+    - thin vessel preservation
+    - connectivity
+    """
+
+
+    def __init__(
+        self,
+        iterations=10,
+        smooth=1e-6,
+    ):
+
+        super().__init__()
+
+        self.iterations = iterations
+
+        self.smooth = smooth
+
+
+
+    def forward(
+        self,
+        prediction,
+        target,
+    ):
+
+
+        prediction = torch.sigmoid(
+            prediction
+        )
+
+
+        pred_skeleton = soft_skeletonize(
+            prediction,
+            self.iterations,
+        )
+
+
+        target_skeleton = soft_skeletonize(
+            target,
+            self.iterations,
+        )
+
+
+
+        tprec = (
+
+            torch.sum(
+                pred_skeleton * target
+            )
+
+            +
+
+            self.smooth
+
+        ) / (
+
+            torch.sum(
+                pred_skeleton
+            )
+
+            +
+
+            self.smooth
+
+        )
+
+
+        tsens = (
+
+            torch.sum(
+                target_skeleton * prediction
+            )
+
+            +
+
+            self.smooth
+
+        ) / (
+
+            torch.sum(
+                target_skeleton
+            )
+
+            +
+
+            self.smooth
+
+        )
+
+
+
+        cldice = (
+
+            2
+            *
+            tprec
+            *
+            tsens
+
+        ) / (
+
+            tprec
+            +
+            tsens
+            +
+            self.smooth
+
+        )
+
+
+        return 1 - cldice
+    # ============================================================
+# BOUNDARY EXTRACTION
+# ============================================================
+
 
 class BoundaryExtractor(nn.Module):
     """
-    Extract soft object boundaries using a Laplacian kernel.
+    Laplacian boundary extractor.
     """
 
-    def __init__(self) -> None:
+
+    def __init__(self):
+
         super().__init__()
+
 
         kernel = torch.tensor(
             [
                 [
                     [
-                        0.0,
-                        1.0,
-                        0.0,
+                        0, 1, 0
                     ],
+
                     [
-                        1.0,
-                        -4.0,
-                        1.0,
+                        1, -4, 1
                     ],
+
                     [
-                        0.0,
-                        1.0,
-                        0.0,
-                    ],
+                        0, 1, 0
+                    ]
                 ]
             ],
             dtype=torch.float32,
         )
 
-        # Kernel shape:
-        # [out_channels=1, in_channels=1, height=3, width=3]
+
         kernel = kernel.unsqueeze(0)
+
 
         self.register_buffer(
             "kernel",
             kernel,
-            persistent=True,
         )
+
+
 
     def forward(
         self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Extract absolute Laplacian boundary responses.
-        """
+        x,
+    ):
 
-        if x.ndim != 4:
-            raise ValueError(
-                "BoundaryExtractor expects a four-dimensional "
-                "tensor with shape [B, C, H, W]."
-            )
-
-        if x.shape[1] != 1:
-            raise ValueError(
-                "BoundaryExtractor currently supports one-channel "
-                f"masks, but received {x.shape[1]} channels."
-            )
 
         kernel = self.kernel.to(
             device=x.device,
             dtype=x.dtype,
         )
 
+
         boundary = F.conv2d(
-            input=x,
-            weight=kernel,
-            bias=None,
-            stride=1,
+            x,
+            kernel,
             padding=1,
         )
+
 
         return torch.abs(
             boundary
         )
 
 
+
+
+
+
 # ============================================================
 # BOUNDARY LOSS
 # ============================================================
 
-class BoundaryLoss(nn.Module):
-    """
-    Penalize differences between predicted and target boundaries.
-    """
 
-    def __init__(self) -> None:
+class BoundaryLoss(nn.Module):
+
+
+    def __init__(self):
+
         super().__init__()
 
         self.extractor = BoundaryExtractor()
 
+
+
     def forward(
         self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Calculate mean-squared boundary discrepancy.
-        """
+        prediction,
+        target,
+    ):
 
-        if prediction.shape != target.shape:
-            raise ValueError(
-                "BoundaryLoss shape mismatch: "
-                f"prediction={tuple(prediction.shape)}, "
-                f"target={tuple(target.shape)}."
-            )
 
-        probability = torch.sigmoid(
+        prediction = torch.sigmoid(
             prediction
         )
 
-        prediction_boundary = self.extractor(
-            probability
+
+        pred_boundary = self.extractor(
+            prediction
         )
+
 
         target_boundary = self.extractor(
             target
         )
 
+
         return F.mse_loss(
-            prediction_boundary,
+            pred_boundary,
             target_boundary,
         )
 
 
+
+
+
+
+
+
 # ============================================================
-# MV-TRANSUNET JOINT LOSS
+# EXPERIMENT B COMPLETE LOSS
 # ============================================================
+
 
 class MVTransUNetLoss(nn.Module):
     """
-    Boundary-aware joint loss with optional deep supervision.
+    Experiment B:
 
-    The module accepts either:
+    Main:
 
-    1. A single segmentation-logit tensor.
+    0.5 Focal Tversky
+    0.3 Boundary
+    0.2 clDice
 
-    2. A dictionary containing:
-        - main_output
-        - auxiliary_outputs
 
-    The main output is always optimized with full weight 1.0.
-    Auxiliary outputs are weighted using auxiliary_weights.
+    Supports:
+
+    Tensor output:
+
+        prediction
+
+
+    Deep supervision output:
+
+        {
+            "main_output": tensor,
+            "auxiliary_outputs": [
+                tensor,
+                tensor,
+                tensor
+            ]
+        }
+
     """
+
 
     def __init__(
         self,
-        alpha: float = 0.4,
-        beta: float = 0.4,
-        gamma: float = 0.2,
-        auxiliary_weights: Sequence[float] = (
+
+        focal_tversky_weight=0.5,
+
+        boundary_weight=0.3,
+
+        cldice_weight=0.2,
+
+        auxiliary_weights=(
             0.10,
             0.20,
             0.30,
         ),
-        smooth: float = 1e-6,
-    ) -> None:
+
+    ):
+
+
         super().__init__()
 
-        if alpha < 0:
-            raise ValueError(
-                "alpha cannot be negative."
-            )
 
-        if beta < 0:
-            raise ValueError(
-                "beta cannot be negative."
-            )
 
-        if gamma < 0:
-            raise ValueError(
-                "gamma cannot be negative."
-            )
-
-        if alpha + beta + gamma <= 0:
-            raise ValueError(
-                "At least one primary loss weight must be positive."
-            )
-
-        if len(auxiliary_weights) == 0:
-            raise ValueError(
-                "auxiliary_weights cannot be empty."
-            )
-
-        if any(
-            weight < 0
-            for weight in auxiliary_weights
-        ):
-            raise ValueError(
-                "Auxiliary loss weights cannot be negative."
-            )
-
-        self.alpha = float(alpha)
-        self.beta = float(beta)
-        self.gamma = float(gamma)
-
-        self.auxiliary_weights = tuple(
-            float(weight)
-            for weight in auxiliary_weights
+        self.focal_tversky_weight = (
+            focal_tversky_weight
         )
 
-        self.bce = nn.BCEWithLogitsLoss()
 
-        self.dice = SoftDiceLoss(
-            smooth=smooth
+        self.boundary_weight = (
+            boundary_weight
         )
 
-        self.boundary = BoundaryLoss()
 
-    def _validate_tensor_pair(
+        self.cldice_weight = (
+            cldice_weight
+        )
+
+
+        self.auxiliary_weights = (
+            auxiliary_weights
+        )
+
+
+
+        self.focal_tversky = (
+            FocalTverskyLoss()
+        )
+
+
+        self.boundary = (
+            BoundaryLoss()
+        )
+
+
+        self.cldice = (
+            SoftCLDiceLoss()
+        )
+
+
+        self.dice = (
+            SoftDiceLoss()
+        )
+
+
+
+    # --------------------------------------------------------
+    # MAIN LOSS
+    # --------------------------------------------------------
+
+
+    def compute_main_loss(
         self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        output_name: str,
-    ) -> None:
-        """
-        Validate one prediction-target pair.
-        """
+        prediction,
+        target,
+    ):
 
-        if not torch.is_tensor(prediction):
-            raise TypeError(
-                f"{output_name} must be a torch.Tensor."
+
+        focal_tversky_loss = (
+            self.focal_tversky(
+                prediction,
+                target,
             )
-
-        if not torch.is_tensor(target):
-            raise TypeError(
-                "target must be a torch.Tensor."
-            )
-
-        if prediction.ndim != 4:
-            raise ValueError(
-                f"{output_name} must have shape [B, C, H, W], "
-                f"but received {tuple(prediction.shape)}."
-            )
-
-        if target.ndim != 4:
-            raise ValueError(
-                "target must have shape [B, C, H, W], "
-                f"but received {tuple(target.shape)}."
-            )
-
-        if prediction.shape != target.shape:
-            raise ValueError(
-                f"{output_name} and target shapes do not match: "
-                f"{tuple(prediction.shape)} versus "
-                f"{tuple(target.shape)}."
-            )
-
-    def _compute_single_output_loss(
-        self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        output_name: str,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute BCE, Dice, boundary, and joint losses for one output.
-        """
-
-        self._validate_tensor_pair(
-            prediction=prediction,
-            target=target,
-            output_name=output_name,
         )
 
-        bce_loss = self.bce(
-            prediction,
-            target,
+
+        boundary_loss = (
+            self.boundary(
+                prediction,
+                target,
+            )
         )
 
-        dice_loss = self.dice(
-            prediction,
-            target,
+
+        cldice_loss = (
+            self.cldice(
+                prediction,
+                target,
+            )
         )
 
-        boundary_loss = self.boundary(
-            prediction,
-            target,
+
+
+        total = (
+
+            self.focal_tversky_weight
+            *
+            focal_tversky_loss
+
+
+            +
+
+            self.boundary_weight
+            *
+            boundary_loss
+
+
+            +
+
+            self.cldice_weight
+            *
+            cldice_loss
+
         )
 
-        joint_loss = (
-            self.alpha * bce_loss
-            + self.beta * dice_loss
-            + self.gamma * boundary_loss
-        )
+
 
         return {
-            "joint_loss": joint_loss,
-            "bce_loss": bce_loss,
-            "dice_loss": dice_loss,
-            "boundary_loss": boundary_loss,
+
+            "loss": total,
+
+            "focal_tversky_loss":
+                focal_tversky_loss,
+
+            "boundary_loss":
+                boundary_loss,
+
+            "cldice_loss":
+                cldice_loss,
+
         }
 
-    def _extract_deep_supervision_outputs(
-        self,
-        prediction: Dict,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        Validate and extract main and auxiliary predictions.
-        """
 
-        if "main_output" not in prediction:
-            raise KeyError(
-                "Deep-supervision prediction dictionary is missing "
-                "'main_output'."
-            )
 
-        if "auxiliary_outputs" not in prediction:
-            raise KeyError(
-                "Deep-supervision prediction dictionary is missing "
-                "'auxiliary_outputs'."
-            )
+    # --------------------------------------------------------
+    # FORWARD
+    # --------------------------------------------------------
 
-        main_output = prediction[
-            "main_output"
-        ]
-
-        auxiliary_outputs = prediction[
-            "auxiliary_outputs"
-        ]
-
-        if not isinstance(
-            auxiliary_outputs,
-            (list, tuple),
-        ):
-            raise TypeError(
-                "'auxiliary_outputs' must be a list or tuple."
-            )
-
-        auxiliary_outputs = list(
-            auxiliary_outputs
-        )
-
-        if len(auxiliary_outputs) != len(
-            self.auxiliary_weights
-        ):
-            raise ValueError(
-                "The number of auxiliary outputs must match the "
-                "number of auxiliary weights. "
-                f"Received {len(auxiliary_outputs)} outputs and "
-                f"{len(self.auxiliary_weights)} weights."
-            )
-
-        return (
-            main_output,
-            auxiliary_outputs,
-        )
 
     def forward(
         self,
-        prediction: PredictionType,
-        target: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute baseline or deep-supervision loss.
+        prediction,
+        target,
+    ):
 
-        Returned keys always include:
-            total_loss
-            bce_loss
-            dice_loss
-            boundary_loss
-            main_loss
-            auxiliary_loss
 
-        The bce_loss, dice_loss, and boundary_loss fields correspond
-        to the main segmentation output, making them compatible with
-        the current training logger.
-        """
 
-        target = target.float()
+        # ============================================
+        # STANDARD OUTPUT
+        # ============================================
 
-        # ----------------------------------------------------
-        # Standard single-output mode
-        # ----------------------------------------------------
 
         if torch.is_tensor(
             prediction
         ):
+
+
             main_losses = (
-                self._compute_single_output_loss(
-                    prediction=prediction,
-                    target=target,
-                    output_name="prediction",
+                self.compute_main_loss(
+                    prediction,
+                    target,
                 )
             )
 
-            zero_loss = (
-                main_losses["joint_loss"]
-                * 0.0
+
+            total_loss = (
+                main_losses["loss"]
             )
 
+
             return {
-                "total_loss": main_losses[
-                    "joint_loss"
-                ],
-                "main_loss": main_losses[
-                    "joint_loss"
-                ],
-                "auxiliary_loss": zero_loss,
-                "bce_loss": main_losses[
-                    "bce_loss"
-                ],
-                "dice_loss": main_losses[
-                    "dice_loss"
-                ],
-                "boundary_loss": main_losses[
-                    "boundary_loss"
-                ],
+
+                "total_loss":
+                    total_loss,
+
+
+                "main_loss":
+                    total_loss,
+
+
+                "auxiliary_loss":
+                    torch.zeros_like(
+                        total_loss
+                    ),
+
+
+                # compatibility
+
+                "dice_loss":
+                    self.dice(
+                        prediction,
+                        target,
+                    ),
+
+
+                "boundary_loss":
+                    main_losses[
+                        "boundary_loss"
+                    ],
+
+
+                "focal_tversky_loss":
+                    main_losses[
+                        "focal_tversky_loss"
+                    ],
+
+
+                "cldice_loss":
+                    main_losses[
+                        "cldice_loss"
+                    ],
             }
 
-        # ----------------------------------------------------
-        # Deep-supervision mode
-        # ----------------------------------------------------
 
-        if not isinstance(
+
+        # ============================================
+        # DEEP SUPERVISION OUTPUT
+        # ============================================
+
+
+        if isinstance(
             prediction,
             dict,
         ):
-            raise TypeError(
-                "prediction must be either a tensor or a dictionary."
-            )
 
-        (
-            main_output,
-            auxiliary_outputs,
-        ) = self._extract_deep_supervision_outputs(
-            prediction
-        )
 
-        main_losses = (
-            self._compute_single_output_loss(
-                prediction=main_output,
-                target=target,
-                output_name="main_output",
-            )
-        )
+            main_output = prediction[
+                "main_output"
+            ]
 
-        weighted_auxiliary_loss = (
-            main_losses["joint_loss"]
-            * 0.0
-        )
 
-        unweighted_auxiliary_loss = (
-            main_losses["joint_loss"]
-            * 0.0
-        )
-
-        auxiliary_bce_loss = (
-            main_losses["bce_loss"]
-            * 0.0
-        )
-
-        auxiliary_dice_loss = (
-            main_losses["dice_loss"]
-            * 0.0
-        )
-
-        auxiliary_boundary_loss = (
-            main_losses["boundary_loss"]
-            * 0.0
-        )
-
-        output_dictionary: Dict[
-            str,
-            torch.Tensor,
-        ] = {}
-
-        for index, (
-            auxiliary_output,
-            auxiliary_weight,
-        ) in enumerate(
-            zip(
-                auxiliary_outputs,
-                self.auxiliary_weights,
-            ),
-            start=1,
-        ):
-            auxiliary_losses = (
-                self._compute_single_output_loss(
-                    prediction=auxiliary_output,
-                    target=target,
-                    output_name=(
-                        f"auxiliary_output_{index}"
-                    ),
+            main_losses = (
+                self.compute_main_loss(
+                    main_output,
+                    target,
                 )
             )
 
-            weighted_loss = (
-                auxiliary_weight
-                * auxiliary_losses[
-                    "joint_loss"
-                ]
+
+            total_loss = (
+                main_losses["loss"]
             )
 
-            weighted_auxiliary_loss = (
-                weighted_auxiliary_loss
-                + weighted_loss
+
+            auxiliary_loss = torch.zeros_like(
+                total_loss
             )
 
-            unweighted_auxiliary_loss = (
-                unweighted_auxiliary_loss
-                + auxiliary_losses[
-                    "joint_loss"
-                ]
+
+
+            auxiliary_outputs = prediction.get(
+                "auxiliary_outputs",
+                [],
             )
 
-            auxiliary_bce_loss = (
-                auxiliary_bce_loss
-                + auxiliary_losses[
-                    "bce_loss"
-                ]
+
+
+            for idx, aux_output in enumerate(
+                auxiliary_outputs
+            ):
+
+
+                if idx >= len(
+                    self.auxiliary_weights
+                ):
+                    break
+
+
+
+                aux_loss = (
+                    self.compute_main_loss(
+                        aux_output,
+                        target,
+                    )["loss"]
+                )
+
+
+                auxiliary_loss += (
+                    self.auxiliary_weights[idx]
+                    *
+                    aux_loss
+                )
+
+
+
+            total = (
+                total_loss
+                +
+                auxiliary_loss
             )
 
-            auxiliary_dice_loss = (
-                auxiliary_dice_loss
-                + auxiliary_losses[
-                    "dice_loss"
-                ]
-            )
 
-            auxiliary_boundary_loss = (
-                auxiliary_boundary_loss
-                + auxiliary_losses[
-                    "boundary_loss"
-                ]
-            )
 
-            output_dictionary[
-                f"auxiliary_{index}_loss"
-            ] = auxiliary_losses[
-                "joint_loss"
-            ]
+            return {
 
-            output_dictionary[
-                f"auxiliary_{index}_weighted_loss"
-            ] = weighted_loss
 
-            output_dictionary[
-                f"auxiliary_{index}_bce_loss"
-            ] = auxiliary_losses[
-                "bce_loss"
-            ]
+                "total_loss":
+                    total,
 
-            output_dictionary[
-                f"auxiliary_{index}_dice_loss"
-            ] = auxiliary_losses[
-                "dice_loss"
-            ]
 
-            output_dictionary[
-                f"auxiliary_{index}_boundary_loss"
-            ] = auxiliary_losses[
-                "boundary_loss"
-            ]
+                "main_loss":
+                    main_losses["loss"],
 
-        number_of_auxiliary_outputs = float(
-            len(auxiliary_outputs)
-        )
 
-        mean_auxiliary_loss = (
-            unweighted_auxiliary_loss
-            / number_of_auxiliary_outputs
-        )
+                "auxiliary_loss":
+                    auxiliary_loss,
 
-        mean_auxiliary_bce_loss = (
-            auxiliary_bce_loss
-            / number_of_auxiliary_outputs
-        )
 
-        mean_auxiliary_dice_loss = (
-            auxiliary_dice_loss
-            / number_of_auxiliary_outputs
-        )
+                # logging compatibility
 
-        mean_auxiliary_boundary_loss = (
-            auxiliary_boundary_loss
-            / number_of_auxiliary_outputs
-        )
+                "dice_loss":
+                    self.dice(
+                        main_output,
+                        target,
+                    ),
 
-        total_loss = (
-            main_losses["joint_loss"]
-            + weighted_auxiliary_loss
-        )
 
-        output_dictionary.update(
-            {
-                "total_loss": total_loss,
+                "boundary_loss":
+                    main_losses[
+                        "boundary_loss"
+                    ],
 
-                "main_loss": main_losses[
-                    "joint_loss"
-                ],
 
-                "auxiliary_loss": (
-                    weighted_auxiliary_loss
-                ),
+                "focal_tversky_loss":
+                    main_losses[
+                        "focal_tversky_loss"
+                    ],
 
-                "mean_auxiliary_loss": (
-                    mean_auxiliary_loss
-                ),
 
-                "bce_loss": main_losses[
-                    "bce_loss"
-                ],
+                "cldice_loss":
+                    main_losses[
+                        "cldice_loss"
+                    ],
 
-                "dice_loss": main_losses[
-                    "dice_loss"
-                ],
 
-                "boundary_loss": main_losses[
-                    "boundary_loss"
-                ],
-
-                "mean_auxiliary_bce_loss": (
-                    mean_auxiliary_bce_loss
-                ),
-
-                "mean_auxiliary_dice_loss": (
-                    mean_auxiliary_dice_loss
-                ),
-
-                "mean_auxiliary_boundary_loss": (
-                    mean_auxiliary_boundary_loss
-                ),
             }
+
+
+        raise TypeError(
+            "Prediction must be tensor or dictionary"
         )
 
-        return output_dictionary
+
+
+
 
 
 # ============================================================
-# LOCAL TEST
+# LOCAL VERIFICATION TEST
 # ============================================================
+
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
+
+
+    print("=" * 70)
+
+    print(
+        "MV-TransUNet Experiment B Loss Verification"
+    )
+
+    print("=" * 70)
+
+
 
     device = torch.device(
         "cuda"
@@ -798,15 +1055,28 @@ if __name__ == "__main__":
         "cpu"
     )
 
-    print("=" * 70)
-    print("MV-TransUNet Deep-Supervision Loss Test")
-    print("=" * 70)
-    print("Device:", device)
+
+    print(
+        "Device:",
+        device,
+    )
+
+
+
+    prediction = torch.randn(
+        2,
+        1,
+        256,
+        256,
+        device=device,
+        requires_grad=True,
+    )
+
 
     target = torch.randint(
-        low=0,
-        high=2,
-        size=(
+        0,
+        2,
+        (
             2,
             1,
             256,
@@ -815,171 +1085,126 @@ if __name__ == "__main__":
         device=device,
     ).float()
 
-    criterion = MVTransUNetLoss(
-        alpha=0.4,
-        beta=0.4,
-        gamma=0.2,
-        auxiliary_weights=(
-            0.10,
-            0.20,
-            0.30,
-        ),
-    ).to(device)
 
-    # --------------------------------------------------------
-    # Standard single-output test
-    # --------------------------------------------------------
 
-    standard_prediction = torch.randn(
-        2,
-        1,
-        256,
-        256,
-        device=device,
-        requires_grad=True,
+    criterion = MVTransUNetLoss().to(
+        device
     )
 
-    standard_losses = criterion(
-        standard_prediction,
+
+
+    print("\nStandard output test")
+
+    result = criterion(
+        prediction,
         target,
     )
 
-    print()
-    print("=" * 70)
-    print("Standard Output Test")
-    print("=" * 70)
 
-    for loss_name in [
-        "total_loss",
-        "main_loss",
-        "auxiliary_loss",
-        "bce_loss",
-        "dice_loss",
-        "boundary_loss",
-    ]:
-        print(
-            f"{loss_name}:",
-            standard_losses[
-                loss_name
-            ].item(),
-        )
 
-    standard_losses[
-        "total_loss"
-    ].backward()
+    for key,value in result.items():
 
-    if standard_prediction.grad is None:
-        raise RuntimeError(
-            "Standard-output backward pass failed."
-        )
+        if torch.is_tensor(value):
 
-    print(
-        "Standard-output backward pass successful."
-    )
-
-    # --------------------------------------------------------
-    # Deep-supervision output test
-    # --------------------------------------------------------
-
-    main_prediction = torch.randn(
-        2,
-        1,
-        256,
-        256,
-        device=device,
-        requires_grad=True,
-    )
-
-    auxiliary_prediction1 = torch.randn(
-        2,
-        1,
-        256,
-        256,
-        device=device,
-        requires_grad=True,
-    )
-
-    auxiliary_prediction2 = torch.randn(
-        2,
-        1,
-        256,
-        256,
-        device=device,
-        requires_grad=True,
-    )
-
-    auxiliary_prediction3 = torch.randn(
-        2,
-        1,
-        256,
-        256,
-        device=device,
-        requires_grad=True,
-    )
-
-    deep_supervision_prediction = {
-        "main_output": main_prediction,
-
-        "auxiliary_outputs": [
-            auxiliary_prediction1,
-            auxiliary_prediction2,
-            auxiliary_prediction3,
-        ],
-    }
-
-    deep_supervision_losses = criterion(
-        deep_supervision_prediction,
-        target,
-    )
-
-    print()
-    print("=" * 70)
-    print("Deep Supervision Test")
-    print("=" * 70)
-
-    for loss_name in [
-        "total_loss",
-        "main_loss",
-        "auxiliary_loss",
-        "bce_loss",
-        "dice_loss",
-        "boundary_loss",
-        "auxiliary_1_loss",
-        "auxiliary_2_loss",
-        "auxiliary_3_loss",
-    ]:
-        print(
-            f"{loss_name}:",
-            deep_supervision_losses[
-                loss_name
-            ].item(),
-        )
-
-    deep_supervision_losses[
-        "total_loss"
-    ].backward()
-
-    prediction_tensors = [
-        main_prediction,
-        auxiliary_prediction1,
-        auxiliary_prediction2,
-        auxiliary_prediction3,
-    ]
-
-    for index, prediction_tensor in enumerate(
-        prediction_tensors,
-        start=1,
-    ):
-        if prediction_tensor.grad is None:
-            raise RuntimeError(
-                f"Gradient was not computed for prediction {index}."
+            print(
+                key,
+                ":",
+                value.item(),
             )
 
+
+
+    result["total_loss"].backward()
+
+
     print(
-        "Deep-supervision backward pass successful."
+        "Standard backward pass successful"
     )
 
-    print()
+
+
+    print("\nDeep supervision test")
+
+
+
+    deep_prediction = {
+
+        "main_output":
+            torch.randn(
+                2,
+                1,
+                256,
+                256,
+                device=device,
+                requires_grad=True,
+            ),
+
+
+        "auxiliary_outputs":
+        [
+
+            torch.randn(
+                2,
+                1,
+                256,
+                256,
+                device=device,
+                requires_grad=True,
+            ),
+
+
+            torch.randn(
+                2,
+                1,
+                256,
+                256,
+                device=device,
+                requires_grad=True,
+            ),
+
+
+            torch.randn(
+                2,
+                1,
+                256,
+                256,
+                device=device,
+                requires_grad=True,
+            ),
+
+        ]
+
+    }
+
+
+
+    deep_result = criterion(
+        deep_prediction,
+        target,
+    )
+
+
+
     print(
-        "All loss tests passed successfully."
+        "Deep supervision total loss:",
+        deep_result[
+            "total_loss"
+        ].item(),
+    )
+
+
+
+    deep_result[
+        "total_loss"
+    ].backward()
+
+
+
+    print(
+        "Deep supervision backward pass successful"
+    )
+
+
+    print(
+        "\nAll Experiment B loss tests passed."
     )
