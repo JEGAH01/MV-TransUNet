@@ -293,9 +293,9 @@ loss:
   # This prevents auxiliary heads from competing too strongly
   # with the final segmentation output.
   auxiliary_weights:
-    - 0.05
     - 0.10
-    - 0.15
+    - 0.20
+    - 0.30
 
   boundary_loss:
     type: "laplacian_boundary"
