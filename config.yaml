@@ -10,7 +10,28 @@
 # Google Colab Pro GPU — NVIDIA A100
 # ============================================================
 
+# ============================================================
+# PATCH-BASED TRAINING
+# ============================================================
 
+patch_training:
+  enabled: true
+
+  patch_size: 256
+  model_input_size: 256
+
+  patches_per_image: 100
+
+  validation_stride: 128
+
+  vessel_center_probability: 0.70
+
+  minimum_vessel_fraction: 0.01
+
+  max_sampling_attempts: 20
+
+  include_empty_validation_patches: true
+  
 # ============================================================
 # PROJECT INFORMATION
 # ============================================================
