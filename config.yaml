@@ -31,7 +31,7 @@ patch_training:
   max_sampling_attempts: 20
 
   include_empty_validation_patches: true
-  
+
 # ============================================================
 # PROJECT INFORMATION
 # ============================================================
@@ -82,9 +82,7 @@ dataset:
   name: "DRIVE"
 
   raw_root_dir: "/content/MV-TransUNet/datasets"
-
-  processed_root_dir: >
-    /content/MV-TransUNet/datasets_processed
+  processed_root_dir: "/content/MV-TransUNet/datasets_processed"
 
   # Official DRIVE development protocol:
   # 20 official training images
@@ -97,11 +95,8 @@ dataset:
   train_dataset:
     name: "DRIVE"
 
-    image_dir: >
-      /content/MV-TransUNet/datasets_processed/DRIVE/images
-
-    mask_dir: >
-      /content/MV-TransUNet/datasets_processed/DRIVE/masks
+    image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/images"
+    mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/masks"
 
   validation_dataset:
     name: "DRIVE"
