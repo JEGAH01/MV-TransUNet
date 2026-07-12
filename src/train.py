@@ -366,6 +366,30 @@ def build_training_loaders(
                         0.70,
                     )
                 ),
+                hard_negative_probability=float(
+                    patch_config.get(
+                        "hard_negative_probability",
+                        0.25,
+                    )
+                ),
+                random_probability=float(
+                    patch_config.get(
+                        "random_probability",
+                        0.15,
+                    )
+                ),
+                hard_negative_max_vessel_fraction=float(
+                    patch_config.get(
+                        "hard_negative_max_vessel_fraction",
+                        0.005,
+                    )
+                ),
+                hard_negative_candidates=int(
+                    patch_config.get(
+                        "hard_negative_candidates",
+                        20,
+                    )
+                ),
                 minimum_vessel_fraction=float(
                     patch_config.get(
                         "minimum_vessel_fraction",
@@ -1798,3 +1822,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
