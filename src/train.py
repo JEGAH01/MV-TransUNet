@@ -11,7 +11,7 @@ Features:
 - Deterministic image-level train-validation splitting
 - Mixed precision training
 - AdamW optimizer
-- Cosine annealing scheduler
+- Validation-Dice-driven adaptive LR reduction (ReduceLROnPlateau)
 - Gradient accumulation
 - Correct unscaled loss reporting
 - Gradient clipping
@@ -27,6 +27,15 @@ Important:
 - Patch training is enabled through `patch_training.enabled` in config.yaml.
 - Image-level splitting occurs before patch extraction, preventing leakage.
 - Whole-image training remains available for controlled ablation studies.
+- The LR scheduler is ReduceLROnPlateau on validation Dice, NOT
+  CosineAnnealingLR keyed to `training.epochs`. A fixed-epoch cosine
+  schedule silently assumes the full epoch budget is always reached;
+  with early stopping enabled this is frequently false (e.g. stopping
+  at epoch 39 of a nominal 150), which starves the run of the
+  low-LR fine-tuning phase a cosine schedule is supposed to provide.
+  ReduceLROnPlateau reacts to actual validation performance instead of
+  a pre-committed epoch count, so it stays correctly calibrated
+  regardless of when early stopping fires.
 """
 
 
@@ -40,7 +49,7 @@ import yaml
 
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -833,7 +842,7 @@ def validate(
 def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: CosineAnnealingLR,
+    scheduler: ReduceLROnPlateau,
     scaler: GradScaler,
     epoch: int,
     best_dice: float,
@@ -869,7 +878,7 @@ def load_checkpoint(
     path: str,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: CosineAnnealingLR,
+    scheduler: ReduceLROnPlateau,
     scaler: GradScaler,
     device: torch.device,
 ) -> Tuple[int, float, int]:
@@ -1203,16 +1212,55 @@ def main() -> None:
         ]
     )
 
-    scheduler = CosineAnnealingLR(
+    scheduler_config = config.get(
+        "scheduler",
+        {},
+    )
+
+    # ReduceLROnPlateau, not CosineAnnealingLR(T_max=epochs).
+    #
+    # A cosine schedule keyed to `training.epochs` implicitly assumes
+    # training always runs the full nominal epoch budget. With early
+    # stopping enabled this assumption is frequently violated -- e.g.
+    # stopping at epoch 39 of a nominal 150 leaves the cosine curve
+    # only ~15% decayed, so the run never reaches the low-LR
+    # fine-tuning regime a cosine schedule is meant to provide before
+    # convergence. ReduceLROnPlateau instead reacts directly to
+    # validation Dice, so LR decay stays correctly calibrated to
+    # whatever epoch early stopping actually settles on, rather than
+    # to a pre-committed epoch count decided before training started.
+    #
+    # `scheduler.patience` is intentionally shorter than
+    # `early_stopping.patience` (default 8 vs 20 below) so that LR is
+    # reduced at least once, ideally twice, before early stopping can
+    # fire -- giving the model a real chance to exploit the annealed
+    # LR before the run ends, instead of stopping just as a beneficial
+    # LR drop would have occurred.
+    scheduler = ReduceLROnPlateau(
         optimizer,
-        T_max=epochs,
-        eta_min=float(
-            config.get(
-                "scheduler",
-                {},
-            ).get(
+        mode="max",
+        factor=float(
+            scheduler_config.get(
+                "factor",
+                0.5,
+            )
+        ),
+        patience=int(
+            scheduler_config.get(
+                "patience",
+                8,
+            )
+        ),
+        threshold=float(
+            scheduler_config.get(
+                "threshold",
+                1e-4,
+            )
+        ),
+        min_lr=float(
+            scheduler_config.get(
                 "min_lr",
-                0.0,
+                1e-6,
             )
         ),
     )
@@ -1363,6 +1411,17 @@ def main() -> None:
         auxiliary_weights,
     )
     print(
+        "LR scheduler:",
+        "ReduceLROnPlateau",
+        f"(mode=max, factor={scheduler.factor}, "
+        f"patience={scheduler.patience}, "
+        f"min_lr={scheduler.min_lrs[0]})",
+    )
+    print(
+        "Early stopping patience:",
+        early_stopping_patience,
+    )
+    print(
         "Checkpoint directory:",
         checkpoint_directory,
     )
@@ -1473,7 +1532,15 @@ def main() -> None:
                 device=device,
             )
 
-            scheduler.step()
+            # ReduceLROnPlateau requires the monitored metric, not a
+            # bare step() call -- this is the actual mechanism that
+            # keeps LR decay coupled to real validation performance
+            # rather than to a fixed epoch count.
+            scheduler.step(
+                validation_metrics[
+                    "dice"
+                ]
+            )
 
             learning_rate = float(
                 optimizer.param_groups[
@@ -1529,6 +1596,10 @@ def main() -> None:
             print(
                 "Learning rate:",
                 f"{learning_rate:.10f}",
+            )
+            print(
+                "Scheduler plateau counter:",
+                f"{scheduler.num_bad_epochs}/{scheduler.patience}",
             )
 
             # ------------------------------------------------
@@ -1637,6 +1708,11 @@ def main() -> None:
             writer.add_scalar(
                 "LearningRate",
                 learning_rate,
+                epoch,
+            )
+            writer.add_scalar(
+                "Scheduler/plateau_counter",
+                scheduler.num_bad_epochs,
                 epoch,
             )
 
