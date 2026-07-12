@@ -4,7 +4,15 @@
 # Retinal Vessel Segmentation Framework
 #
 # Experiment:
-# 512x512 input resolution with reduced deep-supervision weights
+# Patch-based training (256x256 patches, vessel-centred
+# oversampling), Focal Tversky + Boundary + clDice joint loss,
+# ReduceLROnPlateau scheduler on validation Dice.
+#
+# NOTE: this is NOT the 512x512 whole-image experiment from the
+# original roadmap -- patch_training.patch_size /
+# model_input_size are both 256. preprocessing.image_size below
+# is retained only as a fallback for non-patch (whole-image)
+# ablation runs; it is not the resolution used here.
 #
 # Training Platform:
 # Google Colab Pro GPU — NVIDIA A100
@@ -98,6 +106,11 @@ dataset:
     image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/images"
     mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/masks"
 
+  # NOTE: not read by train.py. Both build_dataloaders and
+  # build_patch_dataloaders derive the validation split
+  # internally from train_dataset via a deterministic image-level
+  # split (dataset.validation_ratio / dataset.split_seed). This
+  # block is vestigial; kept only for documentation of intent.
   validation_dataset:
     name: "DRIVE"
 
@@ -137,6 +150,10 @@ dataset:
 # ============================================================
 
 preprocessing:
+  # Used only when patch_training.enabled is false (whole-image
+  # build_dataloaders path). With patch training enabled, the
+  # active resolution is patch_training.model_input_size (256),
+  # not this value.
   image_size:
     height: 512
     width: 512
@@ -274,24 +291,24 @@ model:
 loss:
   name: "MVTransUNetLoss"
 
-  # Joint loss:
-  # 0.4 BCE + 0.4 Dice + 0.2 Boundary
+  # Joint loss (Experiment B):
+  # 0.5 Focal Tversky + 0.3 Boundary + 0.2 clDice
+  #
+  # Previously this key was declared twice (0.3, then a leftover
+  # 0.2 from the old BCE/Dice/Boundary schema further down). YAML
+  # silently keeps the LAST occurrence, so every prior run using
+  # this file actually trained with boundary_weight=0.2, not 0.3.
+  # Fixed here -- there is now exactly one boundary_weight key.
   focal_tversky_weight: 0.5
   boundary_weight: 0.3
   cldice_weight: 0.2
 
-  gamma: 0.2
-
-  # Kept for descriptive experiment metadata.
-  bce_weight: 0.4
-
-  dice_weight: 0.4
-
-  boundary_weight: 0.2
-
-  # Reduced from 0.10, 0.20, 0.30.
-  # This prevents auxiliary heads from competing too strongly
-  # with the final segmentation output.
+  # NOTE: auxiliary_weights below are still the ORIGINAL,
+  # un-reduced values from the 256x256 baseline experiment
+  # (0.10, 0.20, 0.30). The reduced values planned for the
+  # 512x512 experiment (0.05, 0.10, 0.15) were never applied to
+  # this run. Change these explicitly if you want the reduction
+  # -- do not rely on a comment that no longer matches the file.
   auxiliary_weights:
     - 0.10
     - 0.20
@@ -324,9 +341,25 @@ optimizer:
 # ============================================================
 # LEARNING RATE SCHEDULER
 # ============================================================
+#
+# ReduceLROnPlateau on validation Dice (mode="max"), NOT
+# CosineAnnealingLR. A fixed-epoch cosine schedule assumes the
+# full `training.epochs` budget is always reached; with early
+# stopping enabled this is frequently false, which starves the
+# run of its low-LR fine-tuning phase. See train.py for details.
+#
+# scheduler.patience is intentionally shorter than
+# training.early_stopping.patience so LR gets reduced at least
+# once (ideally twice) before early stopping can fire.
 
 scheduler:
-  name: "CosineAnnealingLR"
+  name: "ReduceLROnPlateau"
+
+  factor: 0.5
+
+  patience: 8
+
+  threshold: 0.0001
 
   min_lr: 0.000001
 
@@ -372,8 +405,7 @@ validation:
 # ============================================================
 
 checkpoint:
-  directory: >
-    "/content/MV-TransUNet/checkpoints/drive_patch_256"
+  directory: "/content/MV-TransUNet/checkpoints/drive_patch_256"
 
   # This is a new architecture/training experiment.
   # Do not load checkpoints from the previous 256x256 run.
@@ -395,8 +427,10 @@ checkpoint:
 # ============================================================
 
 logging:
-  directory: >
-    "/content/MV-TransUNet/checkpoints/drive_patch_256"
+  # Separate subfolder from checkpoint.directory -- previously
+  # identical, which mixed TensorBoard event files with .pth
+  # checkpoint files in the same listing.
+  directory: "/content/MV-TransUNet/logs/drive_patch_256"
 
   tensorboard:
     enabled: true
@@ -430,8 +464,7 @@ evaluation:
 
   save_predictions: true
 
-  prediction_directory: >
-    "/content/MV-TransUNet/checkpoints/drive_patch_256/predictions"
+  prediction_directory: "/content/MV-TransUNet/experiments/drive_patch_256/predictions"
 
 
 # ============================================================
@@ -439,13 +472,15 @@ evaluation:
 # ============================================================
 
 experiment:
-  name: "MVTransUNet_DRIVE_512_DS_Reduced"
+  name: "MVTransUNet_DRIVE_Patch256_FocalTversky_clDice"
 
-  output_directory: >
-    "/content/MV-TransUNet/checkpoints/drive_patch_256"
+  output_directory: "/content/MV-TransUNet/experiments/drive_patch_256"
 
   description: >
-    High-resolution DRIVE experiment using 512x512 retinal images,
-    a fixed 80/20 development split, reduced deep-supervision weights,
-    boundary-aware joint loss, mixed-precision training, batch size 4,
-    gradient accumulation of 2, and an NVIDIA A100 GPU.
+    Patch-based DRIVE experiment: 256x256 vessel-centred patches
+    (patch_training.enabled), a fixed 80/20 image-level
+    development split, Focal Tversky + Boundary + clDice joint
+    loss, mixed-precision training, batch size 4, gradient
+    accumulation of 2, ReduceLROnPlateau on validation Dice, and
+    an NVIDIA A100 GPU. Supersedes the earlier 512x512 whole-image
+    plan, which was not run with this configuration.
