@@ -358,8 +358,11 @@ class RandomPatchRetinalDataset(Dataset):
         patch_size: Union[int, Tuple[int, int]] = 256,
         model_input_size: int = 256,
         patches_per_image: int = 100,
-        vessel_center_probability: float = 0.70,
+        vessel_center_probability: float = 0.60,
+        hard_negative_probability: float = 0.25,
+        random_probability: float = 0.15,
         minimum_vessel_fraction: float = 0.01,
+        hard_negative_max_vessel_fraction: float = 0.005,
         max_sampling_attempts: int = 20,
         transform: Optional[A.Compose] = None,
         clahe: bool = True,
@@ -383,13 +386,22 @@ class RandomPatchRetinalDataset(Dataset):
             raise ValueError("patches_per_image must be at least 1.")
         if not 0.0 <= vessel_center_probability <= 1.0:
             raise ValueError("vessel_center_probability must be between 0 and 1.")
+        if not 0.0 <= hard_negative_probability <= 1.0:
+            raise ValueError("hard_negative_probability must be between 0 and 1.")
+        if not 0.0 <= random_probability <= 1.0:
+            raise ValueError("random_probability must be between 0 and 1.")
         if not 0.0 <= minimum_vessel_fraction <= 1.0:
             raise ValueError("minimum_vessel_fraction must be between 0 and 1.")
+        if not 0.0 <= hard_negative_max_vessel_fraction <= 1.0:
+            raise ValueError("hard_negative_max_vessel_fraction must be between 0 and 1.")
 
         self.model_input_size = int(model_input_size)
         self.patches_per_image = int(patches_per_image)
         self.vessel_center_probability = float(vessel_center_probability)
+        self.hard_negative_probability = float(hard_negative_probability)
+        self.random_probability = float(random_probability)
         self.minimum_vessel_fraction = float(minimum_vessel_fraction)
+        self.hard_negative_max_vessel_fraction = float(hard_negative_max_vessel_fraction)
         self.max_sampling_attempts = int(max_sampling_attempts)
         self.transform = transform or get_train_transform(self.model_input_size)
         self.clahe = (
@@ -406,7 +418,7 @@ class RandomPatchRetinalDataset(Dataset):
         image_width: int,
     ) -> Tuple[int, int]:
         top = int(np.random.randint(0, image_height - self.patch_height + 1))
-        left = int(np.random.randint(0, image_width - self.patch_width + 1))
+        left = int(np.random.randint(0, width := image_width - self.patch_width + 1))
         return top, left
 
     def _sample_vessel_coordinates(
@@ -424,20 +436,55 @@ class RandomPatchRetinalDataset(Dataset):
             self.patch_height, self.patch_width,
         )
 
+    def _sample_hard_negative_coordinates(
+        self,
+        image: np.ndarray,
+        mask: np.ndarray,
+    ) -> Tuple[int, int]:
+        image_height, image_width = mask.shape
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        sobel_energy = np.sqrt(sobel_x**2 + sobel_y**2)
+
+        best_top, best_left = self._sample_random_coordinates(image_height, image_width)
+        best_gradient_energy = -1.0
+
+        for _ in range(self.max_sampling_attempts):
+            top, left = self._sample_random_coordinates(image_height, image_width)
+            mask_patch = mask[top:top + self.patch_height, left:left + self.patch_width]
+            
+            if mask_patch.mean() <= self.hard_negative_max_vessel_fraction:
+                energy_patch = sobel_energy[top:top + self.patch_height, left:left + self.patch_width].mean()
+                if energy_patch > best_gradient_energy:
+                    best_gradient_energy = energy_patch
+                    best_top, best_left = top, left
+
+        return best_top, best_left
+
     def _select_patch(
         self,
         image: np.ndarray,
         mask: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, bool]:
-        prefer_vessel = np.random.random() < self.vessel_center_probability
+        p = np.random.random()
+        if p < self.vessel_center_probability:
+            patch_type = "vessel"
+        elif p < (self.vessel_center_probability + self.hard_negative_probability):
+            patch_type = "hard_negative"
+        else:
+            patch_type = "random"
+
         best_patch: Optional[Tuple[np.ndarray, np.ndarray, bool]] = None
         best_vessel_fraction = -1.0
 
         for _ in range(self.max_sampling_attempts):
-            if prefer_vessel:
+            if patch_type == "vessel":
                 coordinates = self._sample_vessel_coordinates(mask)
                 if coordinates is None:
                     coordinates = self._sample_random_coordinates(mask.shape[0], mask.shape[1])
+            elif patch_type == "hard_negative":
+                coordinates = self._sample_hard_negative_coordinates(image, mask)
             else:
                 coordinates = self._sample_random_coordinates(mask.shape[0], mask.shape[1])
 
@@ -448,11 +495,15 @@ class RandomPatchRetinalDataset(Dataset):
             vessel_fraction = float(mask_patch.mean())
 
             if vessel_fraction > best_vessel_fraction:
-                best_patch = (image_patch, mask_patch, prefer_vessel)
+                best_patch = (image_patch, mask_patch, patch_type == "vessel")
                 best_vessel_fraction = vessel_fraction
 
-            if (not prefer_vessel) or vessel_fraction >= self.minimum_vessel_fraction:
-                return image_patch, mask_patch, prefer_vessel
+            if patch_type == "vessel" and vessel_fraction >= self.minimum_vessel_fraction:
+                return image_patch, mask_patch, True
+            elif patch_type == "hard_negative" and vessel_fraction <= self.hard_negative_max_vessel_fraction:
+                return image_patch, mask_patch, False
+            elif patch_type == "random":
+                return image_patch, mask_patch, False
 
         if best_patch is None:
             raise RuntimeError("Patch sampling failed unexpectedly.")
@@ -730,7 +781,7 @@ def build_patch_dataloaders(
     validation_stride: int = 128,
     batch_size: int = 8,
     validation_ratio: float = 0.2,
-    vessel_center_probability: float = 0.70,
+    vessel_center_probability: float = 0.60,
     minimum_vessel_fraction: float = 0.01,
     max_sampling_attempts: int = 20,
     num_workers: int = 2,
@@ -747,7 +798,7 @@ def build_patch_dataloaders(
     The image-level split occurs before patch generation, preventing leakage.
     Suggested first controlled experiment:
       patch_size=256, model_input_size=256, patches_per_image=100,
-      vessel_center_probability=0.70, validation_stride=128.
+      vessel_center_probability=0.60, validation_stride=128.
     """
 
     samples = load_sample_pairs(image_dir, mask_dir)
@@ -795,7 +846,7 @@ def build_all_training_patch_loader(
     patch_size: int = 256,
     model_input_size: int = 256,
     patches_per_image: int = 100,
-    vessel_center_probability: float = 0.70,
+    vessel_center_probability: float = 0.60,
     minimum_vessel_fraction: float = 0.01,
     max_sampling_attempts: int = 20,
     batch_size: int = 8,
@@ -949,7 +1000,7 @@ def verify_patch_pipeline(
             validation_stride=validation_stride,
             batch_size=batch_size,
             validation_ratio=validation_ratio,
-            vessel_center_probability=0.70,
+            vessel_center_probability=0.60,
             minimum_vessel_fraction=0.01,
             num_workers=0,
             clahe=True,
