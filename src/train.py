@@ -1,6 +1,7 @@
 """
 MV-TransUNet Training Engine
 
+Experiment B: Focal Tversky + Boundary + clDice
 Patch-Based / Whole-Image Compatible
 Colab GPU Optimized
 
@@ -454,7 +455,8 @@ def train_one_epoch(
     running_total_loss = 0.0
     running_main_loss = 0.0
     running_auxiliary_loss = 0.0
-    running_bce_loss = 0.0
+    running_focal_tversky_loss = 0.0
+    running_cldice_loss = 0.0
     running_dice_loss = 0.0
     running_boundary_loss = 0.0
     running_dice_score = 0.0
@@ -564,11 +566,17 @@ def train_one_epoch(
             ).detach().item()
         )
 
-        bce_loss_value = float(
+        focal_tversky_loss_value = float(
             loss_dict[
-                "bce_loss"
+                "focal_tversky_loss"
             ].detach().item()
-        )
+       )
+
+        cldice_loss_value = float(
+            loss_dict[
+              "cldice_loss"
+            ].detach().item()
+       )
 
         dice_loss_value = float(
             loss_dict[
@@ -589,7 +597,8 @@ def train_one_epoch(
         running_total_loss += total_loss_value
         running_main_loss += main_loss_value
         running_auxiliary_loss += auxiliary_loss_value
-        running_bce_loss += bce_loss_value
+        running_focal_tversky_loss += focal_tversky_loss_value
+        running_cldice_loss += cldice_loss_value
         running_dice_loss += dice_loss_value
         running_boundary_loss += boundary_loss_value
         running_dice_score += batch_dice_value
@@ -618,8 +627,12 @@ def train_one_epoch(
             running_auxiliary_loss
             / number_of_batches
         ),
-        "bce_loss": (
-            running_bce_loss
+        "focal_tversky_loss": (
+            running_focal_tversky_loss
+            / number_of_batches
+        ),
+        "cldice_loss": (
+            running_cldice_loss
             / number_of_batches
         ),
         "dice_loss": (
@@ -660,7 +673,8 @@ def validate(
     running_total_loss = 0.0
     running_main_loss = 0.0
     running_auxiliary_loss = 0.0
-    running_bce_loss = 0.0
+    running_focal_tversky_loss = 0.0
+    running_cldice_loss = 0.0
     running_dice_loss = 0.0
     running_boundary_loss = 0.0
     running_dice_score = 0.0
@@ -729,9 +743,15 @@ def validate(
                 ).item()
             )
 
-            bce_loss_value = float(
+            focal_tversky_loss_value = float(
                 loss_dict[
-                    "bce_loss"
+                    "focal_tversky_loss"
+                ].item()
+            )
+
+            cldice_loss_value = float(
+                loss_dict[
+                    "cldice_loss"
                 ].item()
             )
 
@@ -754,7 +774,8 @@ def validate(
             running_total_loss += total_loss_value
             running_main_loss += main_loss_value
             running_auxiliary_loss += auxiliary_loss_value
-            running_bce_loss += bce_loss_value
+            running_focal_tversky_loss += focal_tversky_loss_value
+            running_cldice_loss += cldice_loss_value
             running_dice_loss += dice_loss_value
             running_boundary_loss += boundary_loss_value
             running_dice_score += batch_dice_value
@@ -781,8 +802,12 @@ def validate(
             running_auxiliary_loss
             / number_of_batches
         ),
-        "bce_loss": (
-            running_bce_loss
+        "focal_tversky_loss": (
+            running_focal_tversky_loss
+            / number_of_batches
+        ),
+        "cldice_loss": (
+            running_cldice_loss
             / number_of_batches
         ),
         "dice_loss": (
@@ -940,7 +965,7 @@ def main() -> None:
     )
 
     print("=" * 70)
-    print("MV-TransUNet Training")
+    print("MV-TransUNet Experiment B Training")
     print("=" * 70)
     print(
         "Device:",
@@ -1108,21 +1133,21 @@ def main() -> None:
     )
 
     criterion = MVTransUNetLoss(
-        alpha=float(
+        focal_tversky_weight=float(
             loss_config.get(
-                "alpha",
-                0.4,
+                "focal_tversky_weight",
+                0.5,
             )
         ),
-        beta=float(
+        boundary_weight=float(
             loss_config.get(
-                "beta",
-                0.4,
+                "boundary_weight",
+                0.3,
             )
         ),
-        gamma=float(
+        cldice_weight=float(
             loss_config.get(
-                "gamma",
+                "cldice_weight",
                 0.2,
             )
         ),
@@ -1474,12 +1499,28 @@ def main() -> None:
                 f"{train_metrics['auxiliary_loss']:.6f}",
             )
             print(
+                "Train Focal Tversky loss:",
+                f"{train_metrics['focal_tversky_loss']:.6f}",
+            )
+            print(
+                "Train clDice loss:",
+                f"{train_metrics['cldice_loss']:.6f}",
+            )
+            print(
                 "Train Dice:",
                 f"{train_metrics['dice']:.6f}",
             )
             print(
                 "Validation loss:",
                 f"{validation_metrics['total_loss']:.6f}",
+            )
+            print(
+                "Validation Focal Tversky loss:",
+                f"{validation_metrics['focal_tversky_loss']:.6f}",
+            )
+            print(
+                "Validation clDice loss:",
+                f"{validation_metrics['cldice_loss']:.6f}",
             )
             print(
                 "Validation Dice:",
@@ -1516,9 +1557,16 @@ def main() -> None:
                 epoch,
             )
             writer.add_scalar(
-                "Loss/train_bce",
+                "Loss/train_focal_tversky",
                 train_metrics[
-                    "bce_loss"
+                    "focal_tversky_loss"
+                ],
+                epoch,
+            )
+            writer.add_scalar(
+                "Loss/train_cldice",
+                train_metrics[
+                    "cldice_loss"
                 ],
                 epoch,
             )
@@ -1552,9 +1600,16 @@ def main() -> None:
                 epoch,
             )
             writer.add_scalar(
-                "Loss/validation_bce",
+                "Loss/validation_focal_tversky",
                 validation_metrics[
-                    "bce_loss"
+                    "focal_tversky_loss"
+                ],
+                epoch,
+            )
+            writer.add_scalar(
+                "Loss/validation_cldice",
+                validation_metrics[
+                    "cldice_loss"
                 ],
                 epoch,
             )
