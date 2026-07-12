@@ -27,17 +27,19 @@ patch_training:
 
   patch_size: 256
   model_input_size: 256
-
   patches_per_image: 100
-
   validation_stride: 128
 
-  vessel_center_probability: 0.70
+  vessel_center_probability: 0.60
+  hard_negative_probability: 0.25
+  random_probability: 0.15
 
   minimum_vessel_fraction: 0.01
 
-  max_sampling_attempts: 20
+  hard_negative_max_vessel_fraction: 0.005
+  hard_negative_candidates: 20
 
+  max_sampling_attempts: 20
   include_empty_validation_patches: true
 
 # ============================================================
