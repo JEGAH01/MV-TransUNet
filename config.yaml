@@ -1,258 +1,419 @@
 # ============================================================
-# MV-TransUNet Configuration File
+# MV-TransUNet Configuration
+# Official DRIVE Experiment C
+#
 # Boundary-Aware Hybrid CNN-Vision Transformer
 # Retinal Vessel Segmentation Framework
 #
-# Experiment:
-# Patch-based training (256x256 patches, vessel-centred
-# oversampling), Focal Tversky + Boundary + clDice joint loss,
-# ReduceLROnPlateau scheduler on validation Dice.
-#
-# NOTE: this is NOT the 512x512 whole-image experiment from the
-# original roadmap -- patch_training.patch_size /
-# model_input_size are both 256. preprocessing.image_size below
-# is retained only as a fallback for non-patch (whole-image)
-# ablation runs; it is not the resolution used here.
-#
 # Training Platform:
-# Google Colab Pro GPU — NVIDIA A100
+# Google Colab NVIDIA A100
 # ============================================================
 
-# ============================================================
-# PATCH-BASED TRAINING
-# ============================================================
-
-patch_training:
-  enabled: true
-
-  patch_size: 256
-  model_input_size: 256
-  patches_per_image: 100
-  validation_stride: 128
-
-  vessel_center_probability: 0.60
-  hard_negative_probability: 0.25
-  random_probability: 0.15
-
-  minimum_vessel_fraction: 0.01
-
-  hard_negative_max_vessel_fraction: 0.005
-  hard_negative_candidates: 20
-
-  max_sampling_attempts: 20
-  include_empty_validation_patches: true
 
 # ============================================================
 # PROJECT INFORMATION
 # ============================================================
 
 project:
+
   name: "MV-TransUNet"
-  version: "2.1"
+
+  version: "1.0"
+
   task: "retinal_vessel_segmentation"
 
   description: >
     Boundary-aware hybrid CNN-Vision Transformer framework
-    for retinal vessel segmentation, using high-resolution
-    512x512 inputs, vessel attention, multi-scale decoding,
-    reduced deep supervision, and explicit boundary learning.
+    for retinal vessel segmentation using official DRIVE
+    training protocol, patch-based learning, vessel-centred
+    sampling, hard-negative mining, vessel attention,
+    multi-scale decoding, deep supervision, and topology-aware
+    loss optimization.
+
 
 
 # ============================================================
-# RANDOMNESS AND REPRODUCIBILITY
+# RANDOMNESS
 # ============================================================
 
 seed:
+
   value: 42
+
   deterministic: true
 
 
+
 # ============================================================
-# HARDWARE CONFIGURATION
+# HARDWARE
 # ============================================================
 
 hardware:
+
   device: "cuda"
+
   gpu_id: 0
+
   accelerator: "google_colab"
+
   gpu_type: "NVIDIA A100"
 
   mixed_precision: true
 
-  # Keep false for reproducible experiments.
-  # Your train.py also enforces deterministic cuDNN behavior.
-  cudnn_benchmark: false
+  cudnn_benchmark: true
+
 
 
 # ============================================================
 # DATASET CONFIGURATION
+# OFFICIAL DRIVE PROTOCOL
 # ============================================================
 
 dataset:
-  name: "DRIVE"
 
-  raw_root_dir: "/content/MV-TransUNet/datasets"
-  processed_root_dir: "/content/MV-TransUNet/datasets_processed"
+  name: "DRIVE_official"
 
-  # Official DRIVE development protocol:
-  # 20 official training images
-  # 16 training images
-  # 4 validation images
-  validation_ratio: 0.2
+
+  raw_root_dir:
+
+    "/content/MV-TransUNet/datasets"
+
+
+
+  processed_root_dir:
+
+    "/content/MV-TransUNet/datasets_processed"
+
+
+
+  # IMPORTANT:
+  # No random split of DRIVE test images.
+  # DRIVE_train and DRIVE_test remain separated.
+
+  validation_ratio: 0.0
 
   split_seed: 42
 
-  # DRIVE_train / DRIVE_test are SEPARATE folders, verified against
-  # the actual raw dataset (training/ vessel masks at 1st_manual/,
-  # NOT masks/, which is the FOV circle -- same for test/). Produced
-  # by the corrected prepare_datasets.py. Both confirmed via the
-  # sanity check: DRIVE_train foreground fraction 0.075, DRIVE_test
-  # foreground fraction 0.089 -- both plausible vessel densities.
+
+
+  # --------------------------------------------------------
+  # OFFICIAL TRAINING SET
+  # 20 images
+  # --------------------------------------------------------
+
   train_dataset:
-    name: "DRIVE"
 
-    image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE_train/images"
-    mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE_train/masks"
+    name: "DRIVE_train"
 
-  # The ONLY dataset evaluate.py's DRIVE_test evaluation should
-  # touch for the headline reported number. Never referenced by
-  # train.py -- never used for the train/validation split, patch
-  # extraction, or checkpoint selection.
+
+    image_dir:
+
+      "/content/MV-TransUNet/datasets_processed/DRIVE_train/images"
+
+
+    mask_dir:
+
+      "/content/MV-TransUNet/datasets_processed/DRIVE_train/masks"
+
+
+
+
+  # --------------------------------------------------------
+  # OFFICIAL TEST SET
+  # 20 images
+  # NEVER USED DURING TRAINING
+  # --------------------------------------------------------
+
   test_dataset:
-    name: "DRIVE"
 
-    image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE_test/images"
-    mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE_test/masks"
+    name: "DRIVE_test"
 
-  # Additional datasets are reserved for cross-dataset testing.
+
+    image_dir:
+
+      "/content/MV-TransUNet/datasets_processed/DRIVE_test/images"
+
+
+    mask_dir:
+
+      "/content/MV-TransUNet/datasets_processed/DRIVE_test/masks"
+
+
+
+
+  # --------------------------------------------------------
+  # External Generalization Datasets
+  # --------------------------------------------------------
+
   external_datasets:
 
-    STARE:
-      image_dir: >
-        /content/MV-TransUNet/datasets_processed/STARE/images
 
-      mask_dir: >
-        /content/MV-TransUNet/datasets_processed/STARE/masks
+    STARE:
+
+      image_dir:
+
+        "/content/MV-TransUNet/datasets_processed/STARE/images"
+
+
+      mask_dir:
+
+        "/content/MV-TransUNet/datasets_processed/STARE/masks"
+
+
 
     CHASE_DB1:
-      image_dir: >
-        /content/MV-TransUNet/datasets_processed/CHASE_DB1/images
 
-      mask_dir: >
-        /content/MV-TransUNet/datasets_processed/CHASE_DB1/masks
+      image_dir:
+
+        "/content/MV-TransUNet/datasets_processed/CHASE_DB1/images"
+
+
+      mask_dir:
+
+        "/content/MV-TransUNet/datasets_processed/CHASE_DB1/masks"
+
+
 
     HRF:
-      image_dir: >
-        /content/MV-TransUNet/datasets_processed/HRF/images
 
-      mask_dir: >
-        /content/MV-TransUNet/datasets_processed/HRF/masks
+      image_dir:
+
+        "/content/MV-TransUNet/datasets_processed/HRF/images"
+
+
+      mask_dir:
+
+        "/content/MV-TransUNet/datasets_processed/HRF/masks"
+
+
+
 
 
 # ============================================================
-# IMAGE PREPROCESSING
+# PREPROCESSING
 # ============================================================
 
 preprocessing:
-  # Used only when patch_training.enabled is false (whole-image
-  # build_dataloaders path). With patch training enabled, the
-  # active resolution is patch_training.model_input_size (256),
-  # not this value.
+
+
   image_size:
-    height: 512
-    width: 512
+
+    height: 256
+
+    width: 256
+
 
   channels: 3
 
+
+
   clahe:
+
     enabled: true
+
     clip_limit: 2.0
+
     tile_grid_size: 8
 
+
+
   normalization:
+
     enabled: true
 
+
     mean:
+
       - 0.485
+
       - 0.456
+
       - 0.406
 
+
     std:
+
       - 0.229
+
       - 0.224
+
       - 0.225
 
 
+
+
+
 # ============================================================
-# DATA AUGMENTATION
+# PATCH TRAINING
+# ============================================================
+
+patch_training:
+
+
+  enabled: true
+
+
+  patch_size: 256
+
+
+  model_input_size: 256
+
+
+  patches_per_image: 100
+
+
+
+  # Sampling strategy
+
+  vessel_center_probability: 0.60
+
+
+  hard_negative_probability: 0.25
+
+
+  random_probability: 0.15
+
+
+
+  minimum_vessel_fraction: 0.01
+
+
+  hard_negative_max_vessel_fraction: 0.005
+
+
+  hard_negative_candidates: 20
+
+
+  max_sampling_attempts: 20
+
+
+
+  validation_stride: 128
+
+
+  include_empty_validation_patches: true
+
+
+
+
+
+# ============================================================
+# AUGMENTATION
 # ============================================================
 
 augmentation:
+
+
   enabled: true
 
+
   horizontal_flip:
+
     enabled: true
+
     probability: 0.5
+
+
 
   vertical_flip:
+
     enabled: true
+
     probability: 0.5
+
+
 
   rotation:
+
     enabled: true
+
     limit: 30
+
     probability: 0.5
+
+
 
   elastic_transform:
+
     enabled: true
+
     alpha: 120
+
     sigma: 6
+
     probability: 0.3
 
+
+
   brightness_contrast:
+
     enabled: true
+
     probability: 0.5
+
+
+
 
 
 # ============================================================
-# DATALOADER CONFIGURATION
+# DATALOADER
 # ============================================================
 
 dataloader:
-  # Start safely at batch size 4 for 512x512 deep supervision.
-  # Effective batch size = 4 x 2 accumulation steps = 8.
+
+
   batch_size: 4
 
-  num_workers: 2
+
+  num_workers: 4
+
 
   pin_memory: true
 
+
   shuffle: true
+
 
   drop_last: false
 
-  persistent_workers: false
+
+  persistent_workers: true
+
+
+
 
 
 # ============================================================
-# MODEL CONFIGURATION
+# MODEL
 # ============================================================
 
 model:
+
+
   name: "MV-TransUNet"
+
+
 
   input_channels: 3
 
+
   output_channels: 1
 
+
+
   backbone:
+
     encoder: "resnet50"
+
     pretrained: true
 
+
+
   transformer:
+
     name: "ViT-B_16"
 
-    image_size: 512
+    image_size: 256
 
     patch_size: 16
 
@@ -266,209 +427,285 @@ model:
 
     dropout: 0.1
 
+
+
   vessel_attention:
+
     enabled: true
 
     reduction_ratio: 16
 
+
+
   decoder:
+
     type: "multi_scale_progressive"
 
     boundary_attention: true
 
     use_skip_connections: true
 
-    channels:
-      - 512
-      - 256
-      - 128
-      - 64
+
 
   deep_supervision:
+
     enabled: true
 
 
+
+
+
 # ============================================================
-# LOSS CONFIGURATION
+# LOSS
 # ============================================================
 
 loss:
-  name: "MVTransUNetLoss"
 
-  # Joint loss (Experiment B):
-  # 0.5 Focal Tversky + 0.3 Boundary + 0.2 clDice
-  #
-  # Previously this key was declared twice (0.3, then a leftover
-  # 0.2 from the old BCE/Dice/Boundary schema further down). YAML
-  # silently keeps the LAST occurrence, so every prior run using
-  # this file actually trained with boundary_weight=0.2, not 0.3.
-  # Fixed here -- there is now exactly one boundary_weight key.
+
+  name: "Experiment_C_Loss"
+
+
   focal_tversky_weight: 0.5
+
+
   boundary_weight: 0.3
+
+
   cldice_weight: 0.2
 
-  # NOTE: auxiliary_weights below are still the ORIGINAL,
-  # un-reduced values from the 256x256 baseline experiment
-  # (0.10, 0.20, 0.30). The reduced values planned for the
-  # 512x512 experiment (0.05, 0.10, 0.15) were never applied to
-  # this run. Change these explicitly if you want the reduction
-  # -- do not rely on a comment that no longer matches the file.
-  auxiliary_weights:
-    - 0.10
-    - 0.20
-    - 0.30
+
+
+  focal_tversky:
+
+    alpha: 0.7
+
+    beta: 0.3
+
+    gamma: 0.75
+
+
 
   boundary_loss:
+
     type: "laplacian_boundary"
 
     kernel_size: 3
 
 
+
+  cldice:
+
+    enabled: true
+
+
+
+  auxiliary_weights:
+
+    - 0.10
+
+    - 0.20
+
+    - 0.30
+
+
+
+
+
 # ============================================================
-# OPTIMIZER CONFIGURATION
+# OPTIMIZER
 # ============================================================
 
 optimizer:
+
+
   name: "AdamW"
 
-  learning_rate: 0.0001
 
-  weight_decay: 0.0001
+  learning_rate:
+
+    0.0001
+
+
+  weight_decay:
+
+    0.0001
+
 
   betas:
+
     - 0.9
+
     - 0.999
 
-  epsilon: 0.00000001
+
+
 
 
 # ============================================================
-# LEARNING RATE SCHEDULER
+# LR SCHEDULER
 # ============================================================
-#
-# ReduceLROnPlateau on validation Dice (mode="max"), NOT
-# CosineAnnealingLR. A fixed-epoch cosine schedule assumes the
-# full `training.epochs` budget is always reached; with early
-# stopping enabled this is frequently false, which starves the
-# run of its low-LR fine-tuning phase. See train.py for details.
-#
-# scheduler.patience is intentionally shorter than
-# training.early_stopping.patience so LR gets reduced at least
-# once (ideally twice) before early stopping can fire.
 
 scheduler:
+
+
   name: "ReduceLROnPlateau"
+
+
+  mode: "max"
+
 
   factor: 0.5
 
+
   patience: 8
 
-  threshold: 0.0001
 
   min_lr: 0.000001
 
 
+
+
+
 # ============================================================
-# TRAINING CONFIGURATION
+# TRAINING
 # ============================================================
 
 training:
+
+
   epochs: 150
 
-  # Batch size 4 x accumulation 2 = effective batch size 8.
+
   gradient_accumulation_steps: 2
 
+
+
   gradient_clipping:
+
     enabled: true
 
     max_norm: 1.0
 
+
+
   early_stopping:
+
     enabled: true
 
     patience: 20
 
 
-# ============================================================
-# VALIDATION CONFIGURATION
-# ============================================================
 
-validation:
-  frequency: 1
-
-  metric:
-    name: "dice"
-
-    mode: "max"
-
-  threshold: 0.5
 
 
 # ============================================================
-# CHECKPOINT CONFIGURATION
+# CHECKPOINT
 # ============================================================
 
 checkpoint:
-  directory: "/content/MV-TransUNet/checkpoints/drive_patch_256"
 
-  # This is a new architecture/training experiment.
-  # Do not load checkpoints from the previous 256x256 run.
+
+  directory:
+
+    "/content/MV-TransUNet/checkpoints/DRIVE_official_experiment_C"
+
+
+
   resume: false
 
-  save_last: true
 
   save_best: true
 
-  save_best_only: false
 
-  best_model_name: "best_model.pth"
+  save_last: true
 
-  last_model_name: "last_model.pth"
+
+
+  best_model_name:
+
+    "best_model.pth"
+
+
+
 
 
 # ============================================================
-# LOGGING CONFIGURATION
+# LOGGING
 # ============================================================
 
 logging:
-  # Separate subfolder from checkpoint.directory -- previously
-  # identical, which mixed TensorBoard event files with .pth
-  # checkpoint files in the same listing.
-  directory: "/content/MV-TransUNet/logs/drive_patch_256"
+
+
+  directory:
+
+    "/content/MV-TransUNet/logs/DRIVE_official_experiment_C"
+
+
 
   tensorboard:
+
     enabled: true
 
+
+
   log_learning_rate: true
+
 
   log_loss_components: true
 
 
+
+
+
 # ============================================================
-# EVALUATION CONFIGURATION
+# EVALUATION
 # ============================================================
 
 evaluation:
+
+
   threshold: 0.5
 
+
+
   metrics:
+
     - dice
+
     - sensitivity
+
     - specificity
+
     - accuracy
+
     - auc
+
+    - cldice
+
     - thin_vessel_dice
 
+
+
   thin_vessel_analysis:
+
     enabled: true
 
     skeletonization: true
 
     width_threshold_pixels: 3
 
+
+
   save_predictions: true
 
-  prediction_directory: "/content/MV-TransUNet/experiments/drive_patch_256/predictions"
+
+
+  prediction_directory:
+
+    "/content/MV-TransUNet/experiments/DRIVE_official_test_predictions"
+
+
+
 
 
 # ============================================================
@@ -476,15 +713,24 @@ evaluation:
 # ============================================================
 
 experiment:
-  name: "MVTransUNet_DRIVE_Patch256_FocalTversky_clDice"
 
-  output_directory: "/content/MV-TransUNet/experiments/drive_patch_256"
+
+  name:
+
+    "MVTransUNet_DRIVE_Official_Experiment_C"
+
+
+
+  output_directory:
+
+    "/content/MV-TransUNet/experiments/DRIVE_official_experiment_C"
+
+
 
   description: >
-    Patch-based DRIVE experiment: 256x256 vessel-centred patches
-    (patch_training.enabled), a fixed 80/20 image-level
-    development split, Focal Tversky + Boundary + clDice joint
-    loss, mixed-precision training, batch size 4, gradient
-    accumulation of 2, ReduceLROnPlateau on validation Dice, and
-    an NVIDIA A100 GPU. Supersedes the earlier 512x512 whole-image
-    plan, which was not run with this configuration.
+
+    Official DRIVE experiment using 20 training images and
+    20 untouched test images. Patch-based learning with
+    vessel-centred sampling, hard-negative mining,
+    Focal Tversky loss, clDice topology supervision,
+    boundary preservation, and deep supervision.
