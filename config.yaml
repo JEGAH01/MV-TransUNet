@@ -102,25 +102,27 @@ dataset:
 
   split_seed: 42
 
+  # DRIVE_train / DRIVE_test are SEPARATE folders, verified against
+  # the actual raw dataset (training/ vessel masks at 1st_manual/,
+  # NOT masks/, which is the FOV circle -- same for test/). Produced
+  # by the corrected prepare_datasets.py. Both confirmed via the
+  # sanity check: DRIVE_train foreground fraction 0.075, DRIVE_test
+  # foreground fraction 0.089 -- both plausible vessel densities.
   train_dataset:
     name: "DRIVE"
 
-    image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/images"
-    mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE/masks"
+    image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE_train/images"
+    mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE_train/masks"
 
-  # NOTE: not read by train.py. Both build_dataloaders and
-  # build_patch_dataloaders derive the validation split
-  # internally from train_dataset via a deterministic image-level
-  # split (dataset.validation_ratio / dataset.split_seed). This
-  # block is vestigial; kept only for documentation of intent.
-  validation_dataset:
+  # The ONLY dataset evaluate.py's DRIVE_test evaluation should
+  # touch for the headline reported number. Never referenced by
+  # train.py -- never used for the train/validation split, patch
+  # extraction, or checkpoint selection.
+  test_dataset:
     name: "DRIVE"
 
-    image_dir: >
-      /content/MV-TransUNet/datasets_processed/DRIVE/images
-
-    mask_dir: >
-      /content/MV-TransUNet/datasets_processed/DRIVE/masks
+    image_dir: "/content/MV-TransUNet/datasets_processed/DRIVE_test/images"
+    mask_dir: "/content/MV-TransUNet/datasets_processed/DRIVE_test/masks"
 
   # Additional datasets are reserved for cross-dataset testing.
   external_datasets:
