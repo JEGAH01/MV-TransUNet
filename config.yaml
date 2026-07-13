@@ -90,7 +90,7 @@ dataset:
   # No random split of DRIVE test images.
   # DRIVE_train and DRIVE_test remain separated.
 
-  validation_ratio: 0.0
+  validation_ratio: 0.2
 
   split_seed: 42
 
