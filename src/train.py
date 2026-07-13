@@ -1,8 +1,8 @@
 """
 MV-TransUNet Training Engine
 
-Experiment B: Focal Tversky + Boundary + clDice
-Patch-Based / Whole-Image Compatible
+Experiment C: Official DRIVE Protocol - Focal Tversky + Boundary + clDice
+Official DRIVE Protocol - Patch-Based / Whole-Image Compatible
 Colab GPU Optimized
 
 Features:
@@ -998,7 +998,7 @@ def main() -> None:
     )
 
     print("=" * 70)
-    print("MV-TransUNet Experiment B Training")
+    print("MV-TransUNet Official DRIVE Experiment C Training")
     print("=" * 70)
     print(
         "Device:",
@@ -1051,6 +1051,12 @@ def main() -> None:
         "Validation batches:",
         len(validation_loader),
     )
+
+    print()
+    print("Official DRIVE protocol")
+    print("-" * 70)
+    print("Training dataset: DRIVE_train")
+    print("Test dataset: DRIVE_test (reserved for final evaluation)")
 
     patch_config = config.get(
         "patch_training",
@@ -1822,4 +1828,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
