@@ -744,6 +744,252 @@ def main():
                 threshold=threshold,
                 save_directory=str(experiment_output_dir / "predictions" / name),
             )
+@torch.no_grad()
+def evaluate_reconstructed_grid_patches(
+    model,
+    config,
+    device,
+    threshold=0.5,
+):
+    """
+    Whole-image evaluation using deterministic grid patches.
+
+    This reconstructs full retinal predictions from the same
+    GridPatchRetinalDataset used during validation.
+
+    This is different from:
+    - patch Dice validation
+    - direct whole-image resizing
+
+    It evaluates the model in the distribution it was trained on.
+    """
+
+    patch_config = config.get(
+        "patch_training",
+        {}
+    )
+
+    if not bool(
+        patch_config.get(
+            "enabled",
+            False
+        )
+    ):
+        raise ValueError(
+            "Patch training must be enabled "
+            "for reconstructed evaluation."
+        )
+
+    validation_pairs = _reconstruct_validation_pairs(
+        config
+    )
+
+    patch_size = int(
+        patch_config.get(
+            "patch_size",
+            256
+        )
+    )
+
+    model_input_size = int(
+        patch_config.get(
+            "model_input_size",
+            256
+        )
+    )
+
+    stride = int(
+        patch_config.get(
+            "validation_stride",
+            patch_size // 2
+        )
+    )
+
+
+    dataset = GridPatchRetinalDataset(
+        samples=validation_pairs,
+        patch_size=patch_size,
+        model_input_size=model_input_size,
+        stride=stride,
+        transform=get_validation_transform(
+            image_size=model_input_size
+        ),
+        clahe=bool(
+            config["preprocessing"]["clahe"].get(
+                "enabled",
+                True
+            )
+        ),
+        include_empty_patches=True,
+        minimum_vessel_fraction=0.0,
+    )
+
+
+    loader = create_dataloader(
+        dataset=dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        persistent_workers=False,
+        drop_last=False,
+        seed=int(
+            config["dataset"].get(
+                "split_seed",
+                config["seed"]["value"]
+            )
+        ),
+    )
+
+
+    model.eval()
+
+
+    reconstructed = {}
+    targets = {}
+
+
+    for batch in tqdm(
+        loader,
+        desc="Reconstructing validation images",
+    ):
+
+        images = batch["image"].to(
+            device,
+            non_blocking=True,
+        )
+
+        outputs = torch.sigmoid(
+            model(images)
+        )
+
+
+        output = outputs.squeeze().cpu().numpy()
+
+
+        image_index = int(
+            batch["source_image_index"].item()
+        )
+
+        top = int(
+            batch["top"].item()
+        )
+
+        left = int(
+            batch["left"].item()
+        )
+
+
+        if image_index not in reconstructed:
+
+            height = (
+                validation_pairs[image_index][1]
+            )
+
+            mask = load_binary_mask(
+                height
+            )
+
+            h, w = mask.shape
+
+
+            reconstructed[image_index] = {
+                "prediction":
+                    np.zeros(
+                        (h,w),
+                        dtype=np.float32
+                    ),
+
+                "count":
+                    np.zeros(
+                        (h,w),
+                        dtype=np.float32
+                    ),
+            }
+
+            targets[image_index] = mask
+
+
+        prediction = reconstructed[image_index][
+            "prediction"
+        ]
+
+        count = reconstructed[image_index][
+            "count"
+        ]
+
+
+        ph, pw = output.shape
+
+
+        prediction[
+            top:top+ph,
+            left:left+pw
+        ] += output
+
+
+        count[
+            top:top+ph,
+            left:left+pw
+        ] += 1
+
+
+
+    results = []
+
+
+    for image_index in reconstructed:
+
+        prediction = (
+            reconstructed[image_index]["prediction"]
+            /
+            np.maximum(
+                reconstructed[image_index]["count"],
+                1e-8
+            )
+        )
+
+
+        binary_prediction = (
+            prediction > threshold
+        )
+
+
+        metric = calculate_metrics(
+            binary_prediction,
+            targets[image_index]
+        )
+
+        results.append(metric)
+
+
+    mean_dice = np.mean(
+        [
+            item["dice"]
+            for item in results
+        ]
+    )
+
+
+    print("="*60)
+    print(
+        "DRIVE reconstructed validation"
+    )
+    print("="*60)
+
+    print(
+        f"Images evaluated: {len(results)}"
+    )
+
+    print(
+        f"Dice: {mean_dice:.4f}"
+    )
+
+
+    return {
+        "dice": mean_dice,
+        "image_results": results,
+    }
 
     # --------------------------------------------------------
     # SAVE + REPORT
