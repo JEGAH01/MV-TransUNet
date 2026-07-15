@@ -12,7 +12,11 @@ Output:
 
 datasets_processed/
 
-    DRIVE/
+    DRIVE_train/
+        images/
+        masks/
+
+    DRIVE_test/
         images/
         masks/
 
@@ -27,12 +31,35 @@ datasets_processed/
     HRF/
         images/
         masks/
+
+
+IMPORTANT -- DRIVE_train / DRIVE_test separation
+-------------------------------------------------
+An earlier version of this script merged DRIVE/training and DRIVE/test
+into a single combined "DRIVE" output folder before any train/validation
+split occurred downstream. This silently destroyed the standard DRIVE
+evaluation protocol: any 80/20 split subsequently drawn from that merged
+pool could -- and very likely did -- train on images every published
+DRIVE baseline reserves exclusively for held-out testing, making any
+reported Dice score non-comparable to the literature and, more
+seriously, contaminated by test-set leakage.
+
+This version keeps DRIVE_train and DRIVE_test as two entirely separate
+output folders, exactly mirroring the official DRIVE directory
+structure. `dataset.train_dataset` in config.yaml should point at
+DRIVE_train (used for the 80/20 train/validation split during training),
+and a new `dataset.test_dataset` should point at DRIVE_test (used ONLY
+by evaluate.py, never touched during training or model selection).
 """
 
 
 from pathlib import Path
 
 import shutil
+
+import cv2
+
+import numpy as np
 
 
 
@@ -58,6 +85,50 @@ IMAGE_EXTENSIONS = {
     ".gif"
 
 }
+
+
+
+def check_mask_looks_like_vessels(mask_path, split_name, max_plausible_fraction=0.30):
+    """
+    Sanity check against exactly the failure mode this rewrite fixes:
+    DRIVE (and several other retinal datasets) ship TWO different
+    things that both get casually called "mask" -- the field-of-view
+    (FOV) circle, which is ~70-90% foreground, and the actual vessel
+    annotation, which is typically 5-15% foreground. Silently pairing
+    images with the FOV circle instead of the vessel annotation
+    produces a dataset that trains and validates without error, but
+    is not a vessel segmentation dataset at all.
+
+    This loads one prepared mask and checks its foreground fraction.
+    A high fraction almost certainly means the wrong source folder
+    was used. This does not replace looking at the images yourself --
+    it is a cheap automatic backstop, not a substitute for the manual
+    verification that caught this bug in the first place.
+    """
+
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+
+    if mask is None:
+        print(f"WARNING: could not read {mask_path} for sanity check.")
+        return
+
+    foreground_fraction = float((mask > 127).mean())
+
+    print(
+        f"{split_name} mask sanity check ({mask_path.name}): "
+        f"foreground fraction = {foreground_fraction:.3f}"
+    )
+
+    if foreground_fraction > max_plausible_fraction:
+        print(
+            f"WARNING: {split_name} foreground fraction "
+            f"({foreground_fraction:.3f}) is implausibly high for a "
+            f"vessel annotation (expected roughly 0.05-0.15). This "
+            f"looks like a field-of-view (FOV) mask, not a vessel "
+            f"mask. Check masks_subfolder for this split -- do not "
+            f"proceed to training until this is resolved."
+        )
+
 
 
 
@@ -411,80 +482,116 @@ def copy_pairs(pairs,name):
 
 
 # ============================================================
-# DRIVE
+# DRIVE -- TRAIN AND TEST KEPT SEPARATE
 # ============================================================
 
 
-def prepare_drive():
+def prepare_drive_split(
+
+    source_subfolder,
+
+    output_name,
+
+    images_subfolder,
+
+    masks_subfolder,
+
+    expected_count=20,
+
+):
+    """
+    Prepare exactly ONE DRIVE split (training OR test) into its own
+    dedicated output folder. Never call this for both splits into the
+    same output_name -- that is precisely the merging bug an earlier
+    version of this script had.
+
+    images_subfolder / masks_subfolder are EXPLICIT, per-split
+    relative paths (may include a subdirectory, e.g.
+    "manual/1st_manual") rather than assumed constants. DRIVE raw
+    downloads/re-organizations are not guaranteed to use the same
+    folder names or nesting for training vs. test -- verify these by
+    listing the actual raw folders before trusting any default here.
+
+    Also verify masks_subfolder points at the VESSEL annotation, not
+    the field-of-view (FOV) circle -- both are commonly just called
+    "mask(s)" in different DRIVE redistributions, and pairing images
+    with the FOV circle instead of the vessel annotation produces a
+    dataset that trains without any error while being completely
+    wrong. See check_mask_looks_like_vessels below, which is run
+    automatically on every prepared split as a backstop -- but the
+    authoritative check is looking at the images yourself.
+    """
+
+    print(
+
+        f"\nPreparing DRIVE ({source_subfolder} -> {output_name})"
+
+    )
 
 
-    print("\nPreparing DRIVE")
+
+    folder = RAW_DATA_DIR / "DRIVE" / source_subfolder
 
 
 
-    drive=RAW_DATA_DIR/"DRIVE"
+    images = get_files(
+
+        folder / images_subfolder
+
+    )
 
 
 
-    images=[]
+    masks = get_files(
 
-    masks=[]
+        folder / masks_subfolder
 
-
-
-    for folder in [
-
-        drive/"training",
-
-        drive/"test"
-
-    ]:
-
-
-        images.extend(
-
-            get_files(
-
-                folder/"images"
-
-            )
-
-        )
-
-
-
-        masks.extend(
-
-            get_files(
-
-                folder/"masks"
-
-            )
-
-        )
+    )
 
 
 
     print(
 
-        "DRIVE images:",
+        f"{output_name} images:",
 
-        len(images)
+        len(images),
+
+        f"(from {images_subfolder})",
 
     )
 
 
     print(
 
-        "DRIVE masks:",
+        f"{output_name} masks:",
 
-        len(masks)
+        len(masks),
+
+        f"(from {masks_subfolder})",
 
     )
 
 
 
-    pairs=pair_images_masks(
+    if expected_count is not None and len(images) != expected_count:
+
+        print(
+
+            f"WARNING: expected {expected_count} images in "
+
+            f"DRIVE/{source_subfolder}/{images_subfolder}, found "
+
+            f"{len(images)}. Verify raw dataset integrity before "
+
+            "trusting any downstream train/validation split or "
+
+            "reported metric."
+
+        )
+
+
+
+    pairs = pair_images_masks(
 
         images,
 
@@ -496,7 +603,7 @@ def prepare_drive():
 
     print(
 
-        "DRIVE pairs:",
+        f"{output_name} pairs:",
 
         len(pairs)
 
@@ -504,11 +611,85 @@ def prepare_drive():
 
 
 
-    return copy_pairs(
+    count = copy_pairs(
 
         pairs,
 
-        "DRIVE"
+        output_name
+
+    )
+
+
+
+    if count > 0:
+
+        first_mask_path = (
+
+            OUTPUT_DIR / output_name / "masks"
+
+        )
+
+        first_mask_files = get_files(first_mask_path)
+
+        if first_mask_files:
+
+            check_mask_looks_like_vessels(
+
+                first_mask_files[0],
+
+                output_name,
+
+            )
+
+
+
+    return count
+
+
+
+
+
+def prepare_drive_train():
+
+    return prepare_drive_split(
+
+        source_subfolder="training",
+
+        output_name="DRIVE_train",
+
+        # Verified against the actual raw folder listing:
+        # training/ uses "image" (singular) for images, and the
+        # vessel annotation is directly at training/1st_manual/ (flat,
+        # same nesting level as test/1st_manual/) -- NOT
+        # training/masks, which is the FOV circle, and NOT nested
+        # under a "manual" folder as an earlier version of this
+        # function incorrectly assumed.
+        images_subfolder="image",
+
+        masks_subfolder="1st_manual",
+
+    )
+
+
+
+
+
+def prepare_drive_test():
+
+    return prepare_drive_split(
+
+        source_subfolder="test",
+
+        output_name="DRIVE_test",
+
+        # Verified against the actual raw folder listing:
+        # test/ uses "images" (plural), and the vessel annotation is
+        # directly at test/1st_manual/ (no "manual" nesting level,
+        # unlike training/) -- NOT test/masks, which is the FOV
+        # circle.
+        images_subfolder="images",
+
+        masks_subfolder="1st_manual",
 
     )
 
@@ -832,7 +1013,9 @@ def dataset_report():
 
     for name in [
 
-        "DRIVE",
+        "DRIVE_train",
+
+        "DRIVE_test",
 
         "STARE",
 
@@ -882,6 +1065,26 @@ def dataset_report():
 
 
 
+    print(
+
+        "\nDRIVE_train and DRIVE_test are now separate folders. "
+
+        "Update config.yaml: dataset.train_dataset -> DRIVE_train, "
+
+        "dataset.test_dataset -> DRIVE_test. Any model previously "
+
+        "trained against the old merged datasets_processed/DRIVE/ "
+
+        "folder must be retrained -- its validation/early-stopping "
+
+        "checkpoint selection may have used images now assigned to "
+
+        "DRIVE_test."
+
+    )
+
+
+
 
 
 
@@ -901,7 +1104,9 @@ def main():
     )
 
 
-    prepare_drive()
+    prepare_drive_train()
+
+    prepare_drive_test()
 
     prepare_stare()
 

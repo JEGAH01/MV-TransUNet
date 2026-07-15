@@ -448,6 +448,10 @@ class RandomPatchRetinalDataset(Dataset):
             else None
         )
 
+        # RAM Caching: Pre-load all source images and masks into RAM
+        self.cached_images = [load_rgb_image(p[0]) for p in self.samples]
+        self.cached_masks = [load_binary_mask(p[1]) for p in self.samples]
+
     def __len__(self) -> int:
         return len(self.samples) * self.patches_per_image
 
@@ -698,8 +702,10 @@ class RandomPatchRetinalDataset(Dataset):
         ) % len(self.samples)
 
         image_path, mask_path = self.samples[image_index]
-        image = load_rgb_image(image_path)
-        mask = load_binary_mask(mask_path)
+        
+        # Directly extract from RAM memory instead of loading from disk
+        image = self.cached_images[image_index]
+        mask = self.cached_masks[image_index]
 
         image, mask = pad_to_minimum_size(
             image,
@@ -776,12 +782,17 @@ class GridPatchRetinalDataset(Dataset):
             CLAHEEnhancement(clahe_clip_limit, clahe_tile_grid_size)
             if clahe else None
         )
+        
+        # RAM Caching: Pre-load all source images and masks into RAM
+        self.cached_images = [load_rgb_image(p[0]) for p in self.samples]
+        self.cached_masks = [load_binary_mask(p[1]) for p in self.samples]
+
         self.patch_records: List[Tuple[int, int, int]] = []
         self._build_patch_records()
 
     def _build_patch_records(self) -> None:
-        for sample_index, (_, mask_path) in enumerate(self.samples):
-            mask = load_binary_mask(mask_path)
+        for sample_index in range(len(self.samples)):
+            mask = self.cached_masks[sample_index]
             dummy_image = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
             dummy_image, mask = pad_to_minimum_size(
                 dummy_image, mask, self.patch_height, self.patch_width
@@ -812,8 +823,10 @@ class GridPatchRetinalDataset(Dataset):
         sample_index, top, left = self.patch_records[index]
         image_path, mask_path = self.samples[sample_index]
 
-        image = load_rgb_image(image_path)
-        mask = load_binary_mask(mask_path)
+        # Directly extract from RAM memory instead of loading from disk
+        image = self.cached_images[sample_index]
+        mask = self.cached_masks[sample_index]
+        
         image, mask = pad_to_minimum_size(
             image, mask, self.patch_height, self.patch_width
         )
