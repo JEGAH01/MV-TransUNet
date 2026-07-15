@@ -1149,6 +1149,20 @@ def main() -> None:
             )
         ),
         deep_supervision=deep_supervision_enabled,
+        # Spatial dropout in decoder ConvBlocks (see decoder.py).
+        # Default 0.1 is a direct response to the observed
+        # train/validation Dice gap; set model.decoder.dropout_rate
+        # to 0.0 in config.yaml to exactly reproduce prior
+        # (undropped) runs for a clean ablation comparison.
+        decoder_dropout_rate=float(
+            model_config.get(
+                "decoder",
+                {},
+            ).get(
+                "dropout_rate",
+                0.1,
+            )
+        ),
     ).to(device)
 
     # --------------------------------------------------------
@@ -1435,6 +1449,10 @@ def main() -> None:
     print(
         "Deep supervision:",
         deep_supervision_enabled,
+    )
+    print(
+        "Decoder dropout rate:",
+        model.decoder_dropout_rate,
     )
     print(
         "Auxiliary weights:",

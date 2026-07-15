@@ -7,7 +7,7 @@ for Retinal Vessel Segmentation
 Components:
 1. ResNet50 + Vision Transformer encoder
 2. Vessel Attention Module
-3. Multi-scale progressive decoder
+3. Multi-scale progressive decoder (optional spatial dropout)
 4. Optional deep supervision
 
 Input:
@@ -75,7 +75,8 @@ class MVTransUNet(nn.Module):
     - ResNet50 multi-scale CNN features;
     - Vision Transformer global-context features;
     - vessel attention;
-    - progressive skip-connected decoding;
+    - progressive skip-connected decoding, with optional spatial
+      dropout regularization (decoder_dropout_rate);
     - optional deep supervision.
 
     When deep supervision is enabled:
@@ -96,6 +97,7 @@ class MVTransUNet(nn.Module):
         vessel_reduction_ratio: int = 16,
         output_channels: int = 1,
         deep_supervision: bool = True,
+        decoder_dropout_rate: float = 0.1,
     ) -> None:
         super().__init__()
 
@@ -114,11 +116,17 @@ class MVTransUNet(nn.Module):
                 "output_channels must be greater than zero."
             )
 
+        if not 0.0 <= decoder_dropout_rate < 1.0:
+            raise ValueError(
+                "decoder_dropout_rate must be in [0, 1)."
+            )
+
         self.pretrained = pretrained
         self.transformer_channels = transformer_channels
         self.vessel_reduction_ratio = vessel_reduction_ratio
         self.output_channels = output_channels
         self.deep_supervision = deep_supervision
+        self.decoder_dropout_rate = decoder_dropout_rate
 
         # ----------------------------------------------------
         # Hybrid ResNet50 + Vision Transformer encoder
@@ -145,6 +153,7 @@ class MVTransUNet(nn.Module):
         self.decoder = MultiScaleDecoder(
             output_channels=output_channels,
             deep_supervision=deep_supervision,
+            dropout_rate=decoder_dropout_rate,
         )
 
     def forward(
@@ -259,6 +268,7 @@ def build_mv_transunet(
     vessel_reduction_ratio: int = 16,
     output_channels: int = 1,
     deep_supervision: bool = True,
+    decoder_dropout_rate: float = 0.1,
 ) -> MVTransUNet:
     """
     Build an MV-TransUNet model instance.
@@ -270,6 +280,7 @@ def build_mv_transunet(
         vessel_reduction_ratio=vessel_reduction_ratio,
         output_channels=output_channels,
         deep_supervision=deep_supervision,
+        decoder_dropout_rate=decoder_dropout_rate,
     )
 
 
@@ -319,6 +330,7 @@ if __name__ == "__main__":
         vessel_reduction_ratio=16,
         output_channels=1,
         deep_supervision=True,
+        decoder_dropout_rate=0.1,
     ).to(device)
 
     input_tensor = torch.randn(

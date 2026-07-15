@@ -7,6 +7,9 @@ Features:
 - Progressive bilinear upsampling
 - Boundary-preserving convolution refinement
 - Optional deep supervision
+- Optional spatial (channel) dropout in decoder ConvBlocks, added in
+  response to an observed train/validation Dice gap -- see
+  MultiScaleDecoder's dropout_rate parameter
 - Backward-compatible inference output
 
 Deep-supervision outputs:
@@ -40,12 +43,30 @@ class ConvBlock(nn.Module):
         Conv3x3
         BatchNorm
         ReLU
+        Dropout2d (optional, applied only if dropout_rate > 0)
+
+    dropout_rate uses nn.Dropout2d (spatial/channel dropout), not
+    plain elementwise Dropout: neighboring pixels in a conv feature
+    map are highly spatially correlated, so zeroing individual pixels
+    barely perturbs the effective information content (a dropped
+    pixel's neighbors still carry nearly the same signal). Dropout2d
+    zeroes entire feature CHANNELS instead, which is the standard,
+    effective way to regularize convolutional feature maps (Tompson
+    et al., 2015) and is what similar segmentation architectures use.
+
+    Only added to DecoderBlock's internal ConvBlock (decoder1/2/3),
+    NOT to SegmentationHead or final_upsample -- regularizing the
+    feature-extraction stages, not the final logit-producing layers
+    immediately before the loss, is the standard placement; dropout
+    directly before a 1x1 logit head tends to just inject prediction
+    noise rather than improve generalization.
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
+        dropout_rate: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -59,7 +80,12 @@ class ConvBlock(nn.Module):
                 "out_channels must be greater than zero."
             )
 
-        self.block = nn.Sequential(
+        if not 0.0 <= dropout_rate < 1.0:
+            raise ValueError(
+                "dropout_rate must be in [0, 1)."
+            )
+
+        layers = [
             nn.Conv2d(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -93,7 +119,14 @@ class ConvBlock(nn.Module):
             nn.ReLU(
                 inplace=True,
             ),
-        )
+        ]
+
+        if dropout_rate > 0.0:
+            layers.append(
+                nn.Dropout2d(p=dropout_rate)
+            )
+
+        self.block = nn.Sequential(*layers)
 
     def forward(
         self,
@@ -118,6 +151,7 @@ class DecoderBlock(nn.Module):
         input_channels: int,
         skip_channels: int,
         output_channels: int,
+        dropout_rate: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -146,6 +180,7 @@ class DecoderBlock(nn.Module):
                 + skip_channels
             ),
             out_channels=output_channels,
+            dropout_rate=dropout_rate,
         )
 
     def forward(
@@ -302,32 +337,49 @@ class MultiScaleDecoder(nn.Module):
         self,
         output_channels: int = 1,
         deep_supervision: bool = False,
+        dropout_rate: float = 0.1,
     ) -> None:
         super().__init__()
 
+        if not 0.0 <= dropout_rate < 1.0:
+            raise ValueError(
+                "dropout_rate must be in [0, 1)."
+            )
+
         self.output_channels = output_channels
         self.deep_supervision = deep_supervision
+        self.dropout_rate = dropout_rate
 
         # ----------------------------------------------------
         # Progressive decoder stages
+        #
+        # dropout_rate=0.1 by default: motivated by an observed
+        # train/validation Dice gap (~0.85 train vs. ~0.78 val) on a
+        # 16-image training split -- a small, targeted regularization
+        # response to a measured overfitting signal, not a
+        # speculative addition. Set to 0.0 to exactly reproduce prior
+        # (undropped) runs for a clean ablation comparison.
         # ----------------------------------------------------
 
         self.decoder1 = DecoderBlock(
             input_channels=768,
             skip_channels=1024,
             output_channels=512,
+            dropout_rate=dropout_rate,
         )
 
         self.decoder2 = DecoderBlock(
             input_channels=512,
             skip_channels=512,
             output_channels=256,
+            dropout_rate=dropout_rate,
         )
 
         self.decoder3 = DecoderBlock(
             input_channels=256,
             skip_channels=256,
             output_channels=128,
+            dropout_rate=dropout_rate,
         )
 
         # ----------------------------------------------------
