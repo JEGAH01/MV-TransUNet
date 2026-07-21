@@ -529,6 +529,8 @@ def train_one_epoch(
     running_dice_loss = 0.0
     running_boundary_loss = 0.0
     running_dice_score = 0.0
+    valid_batches = 0
+    skipped_batches = 0
 
     optimizer.zero_grad(
         set_to_none=True
@@ -551,6 +553,19 @@ def train_one_epoch(
             non_blocking=True,
         )
 
+        if (
+            not torch.isfinite(images).all()
+            or
+            not torch.isfinite(masks).all()
+        ):
+            skipped_batches += 1
+            optimizer.zero_grad(set_to_none=True)
+            progress.write(
+                f"Warning: skipped training batch {step + 1}: "
+                "input image or mask contains NaN/Inf."
+            )
+            continue
+
         amp_enabled = (
             device.type == "cuda"
         )
@@ -572,6 +587,35 @@ def train_one_epoch(
                 "total_loss"
             ]
 
+            required_loss_keys = (
+                "total_loss",
+                "focal_tversky_loss",
+                "cldice_loss",
+                "dice_loss",
+                "boundary_loss",
+            )
+
+            losses_are_finite = all(
+                key in loss_dict
+                and torch.is_tensor(loss_dict[key])
+                and torch.isfinite(loss_dict[key]).all()
+                for key in required_loss_keys
+            )
+
+            main_output_for_check = get_main_output(outputs)
+
+            if (
+                not torch.isfinite(main_output_for_check).all()
+                or not losses_are_finite
+            ):
+                skipped_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                progress.write(
+                    f"Warning: skipped training batch {step + 1}: "
+                    "model output or loss contains NaN/Inf."
+                )
+                continue
+
             backward_loss = (
                 total_loss
                 / accumulation_steps
@@ -592,11 +636,25 @@ def train_one_epoch(
                 optimizer
             )
 
-            if gradient_clip_enabled:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    max_norm=gradient_clip_max_norm,
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=(
+                    gradient_clip_max_norm
+                    if gradient_clip_enabled
+                    else float("inf")
+                ),
+                error_if_nonfinite=False,
+            )
+
+            if not torch.isfinite(gradient_norm):
+                skipped_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                progress.write(
+                    f"Warning: skipped optimizer update near batch "
+                    f"{step + 1}: gradient norm contains NaN/Inf."
                 )
+                continue
 
             scaler.step(
                 optimizer
@@ -671,17 +729,29 @@ def train_one_epoch(
         running_dice_loss += dice_loss_value
         running_boundary_loss += boundary_loss_value
         running_dice_score += batch_dice_value
+        valid_batches += 1
 
         progress.set_postfix(
             total=f"{total_loss_value:.4f}",
             main=f"{main_loss_value:.4f}",
             aux=f"{auxiliary_loss_value:.4f}",
             dice=f"{batch_dice_value:.4f}",
+            skipped=skipped_batches,
         )
 
-    number_of_batches = len(
-        loader
-    )
+    if valid_batches == 0:
+        raise RuntimeError(
+            "Every training batch was non-finite. "
+            "Training stopped before saving a corrupted checkpoint."
+        )
+
+    if skipped_batches / max(1, len(loader)) > 0.05:
+        raise RuntimeError(
+            f"Skipped {skipped_batches}/{len(loader)} training batches. "
+            "This exceeds the 5% numerical-safety limit."
+        )
+
+    number_of_batches = valid_batches
 
     return {
         "total_loss": (
@@ -716,6 +786,8 @@ def train_one_epoch(
             running_dice_score
             / number_of_batches
         ),
+        "valid_batches": float(valid_batches),
+        "skipped_batches": float(skipped_batches),
     }
 
 
@@ -747,6 +819,8 @@ def validate(
     running_dice_loss = 0.0
     running_boundary_loss = 0.0
     running_dice_score = 0.0
+    valid_batches = 0
+    skipped_batches = 0
 
     progress = tqdm(
         loader,
@@ -755,7 +829,7 @@ def validate(
     )
 
     with torch.inference_mode():
-        for batch in progress:
+        for step, batch in enumerate(progress):
             images = batch["image"].to(
                 device,
                 non_blocking=True,
@@ -765,6 +839,18 @@ def validate(
                 device,
                 non_blocking=True,
             )
+
+            if (
+                not torch.isfinite(images).all()
+                or
+                not torch.isfinite(masks).all()
+            ):
+                skipped_batches += 1
+                progress.write(
+                    f"Warning: skipped validation batch {step + 1}: "
+                    "input image or mask contains NaN/Inf."
+                )
+                continue
 
             amp_enabled = (
                 device.type == "cuda"
@@ -786,6 +872,32 @@ def validate(
             main_output = get_main_output(
                 outputs
             )
+
+            required_loss_keys = (
+                "total_loss",
+                "focal_tversky_loss",
+                "cldice_loss",
+                "dice_loss",
+                "boundary_loss",
+            )
+
+            losses_are_finite = all(
+                key in loss_dict
+                and torch.is_tensor(loss_dict[key])
+                and torch.isfinite(loss_dict[key]).all()
+                for key in required_loss_keys
+            )
+
+            if (
+                not torch.isfinite(main_output).all()
+                or not losses_are_finite
+            ):
+                skipped_batches += 1
+                progress.write(
+                    f"Warning: skipped validation batch {step + 1}: "
+                    "model output or loss contains NaN/Inf."
+                )
+                continue
 
             batch_dice = dice_score(
                 main_output,
@@ -848,15 +960,27 @@ def validate(
             running_dice_loss += dice_loss_value
             running_boundary_loss += boundary_loss_value
             running_dice_score += batch_dice_value
+            valid_batches += 1
 
             progress.set_postfix(
                 loss=f"{total_loss_value:.4f}",
                 dice=f"{batch_dice_value:.4f}",
+                skipped=skipped_batches,
             )
 
-    number_of_batches = len(
-        loader
-    )
+    if valid_batches == 0:
+        raise RuntimeError(
+            "Every validation batch was non-finite. "
+            "The epoch cannot be evaluated safely."
+        )
+
+    if skipped_batches > 0:
+        raise RuntimeError(
+            f"Validation produced {skipped_batches} non-finite batch(es). "
+            "Scheduler stepping and checkpoint saving were blocked."
+        )
+
+    number_of_batches = valid_batches
 
     return {
         "total_loss": (
@@ -891,6 +1015,8 @@ def validate(
             running_dice_score
             / number_of_batches
         ),
+        "valid_batches": float(valid_batches),
+        "skipped_batches": float(skipped_batches),
     }
 
 
@@ -1568,14 +1694,29 @@ def main() -> None:
         )
     )
 
+    resume_from_best = bool(
+        config[
+            "checkpoint"
+        ].get(
+            "resume_from_best",
+            False,
+        )
+    )
+
+    resume_checkpoint_path = (
+        best_checkpoint_path
+        if resume_from_best
+        else last_checkpoint_path
+    )
+
     if (
         resume_enabled
-        and last_checkpoint_path.exists()
+        and resume_checkpoint_path.exists()
     ):
         print()
         print(
             "Resuming from:",
-            last_checkpoint_path,
+            resume_checkpoint_path,
         )
 
         (
@@ -1584,7 +1725,7 @@ def main() -> None:
             patience_counter,
         ) = load_checkpoint(
             path=str(
-                last_checkpoint_path
+                resume_checkpoint_path
             ),
             model=model,
             optimizer=optimizer,
@@ -1641,6 +1782,34 @@ def main() -> None:
             # bare step() call -- this is the actual mechanism that
             # keeps LR decay coupled to real validation performance
             # rather than to a fixed epoch count.
+            epoch_metric_values = [
+                train_metrics["total_loss"],
+                train_metrics["main_loss"],
+                train_metrics["auxiliary_loss"],
+                train_metrics["focal_tversky_loss"],
+                train_metrics["cldice_loss"],
+                train_metrics["dice_loss"],
+                train_metrics["boundary_loss"],
+                train_metrics["dice"],
+                validation_metrics["total_loss"],
+                validation_metrics["main_loss"],
+                validation_metrics["auxiliary_loss"],
+                validation_metrics["focal_tversky_loss"],
+                validation_metrics["cldice_loss"],
+                validation_metrics["dice_loss"],
+                validation_metrics["boundary_loss"],
+                validation_metrics["dice"],
+            ]
+
+            if not all(
+                np.isfinite(value)
+                for value in epoch_metric_values
+            ):
+                raise RuntimeError(
+                    "A non-finite epoch metric was detected. "
+                    "Scheduler stepping and checkpoint saving were blocked."
+                )
+
             scheduler.step(
                 validation_metrics[
                     "dice"
@@ -1681,6 +1850,10 @@ def main() -> None:
             print(
                 "Train Dice:",
                 f"{train_metrics['dice']:.6f}",
+            )
+            print(
+                "Skipped training batches:",
+                int(train_metrics["skipped_batches"]),
             )
             print(
                 "Validation loss:",
