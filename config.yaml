@@ -1,30 +1,28 @@
 # ============================================================
-# MV-TransUNet Experiment D Configuration
-# Generalization Optimization for DRIVE 0.85 Dice Target
+# MV-TransUNet D2-S Configuration
+# Source-Only Vessel-Scale Augmentation
 #
-# Changes:
-# - More patch diversity
-# - Smaller vessel-focused patches
-# - Stronger hard-negative mining
-# - Loss rebalancing
-# - Longer training
-# - A100 optimization
+# Scientific objective:
+# Test whether vessel-scale augmentation learned from DRIVE
+# improves zero-shot cross-dataset generalization.
 #
-# GPU:
-# NVIDIA A100-SXM4-80GB
+# Training:
+# - DRIVE_train only
+# - DRIVE validation used for model selection
+# - DRIVE_test reserved for final evaluation
+# - STARE, CHASE_DB1, and HRF remain zero-shot test datasets
 # ============================================================
 
 
 project:
   name: "MV-TransUNet"
-  version: "D2_S_Scale_Augmentation"
+  version: "D2_S_Scale_Augmentation_Stable"
   task: "retinal_vessel_segmentation"
 
 
 seed:
   value: 42
   deterministic: true
-
 
 
 # ============================================================
@@ -34,10 +32,14 @@ seed:
 hardware:
   device: "cuda"
   accelerator: "google_colab"
-  gpu_type: "NVIDIA_A100_80GB"
-  mixed_precision: true
-  cudnn_benchmark: true
+  gpu_type: "NVIDIA_T4"
 
+  # Disable AMP for this diagnostic/stable run.
+  # The previous run developed repeated non-finite gradients.
+  mixed_precision: false
+
+  # Deterministic mode takes priority.
+  cudnn_benchmark: false
 
 
 # ============================================================
@@ -45,45 +47,23 @@ hardware:
 # ============================================================
 
 dataset:
-
   name: "DRIVE"
 
-  raw_root_dir:
-    "/content/MV-TransUNet/datasets"
+  raw_root_dir: "datasets"
+  processed_root_dir: "datasets_processed"
 
-  processed_root_dir:
-    "/content/MV-TransUNet/datasets_processed"
-
-
-  # official DRIVE protocol
   train_dataset:
-
     name: "DRIVE_train"
-
-    image_dir:
-      "datasets_processed/DRIVE_train/images"
-
-    mask_dir:
-      "datasets_processed/DRIVE_train/masks"
-
-
+    image_dir: "datasets_processed/DRIVE_train/images"
+    mask_dir: "datasets_processed/DRIVE_train/masks"
 
   test_dataset:
-
     name: "DRIVE_test"
-
-    image_dir:
-      "datasets_processed/DRIVE_test/images"
-
-    mask_dir:
-      "datasets_processed/DRIVE_test/masks"
-
-
+    image_dir: "datasets_processed/DRIVE_test/images"
+    mask_dir: "datasets_processed/DRIVE_test/masks"
 
   validation_ratio: 0.20
-
   split_seed: 42
-
 
 
 # ============================================================
@@ -91,58 +71,35 @@ dataset:
 # ============================================================
 
 patch_training:
-
   enabled: true
 
-
-  # Experiment D
   patch_size: 128
-
   model_input_size: 256
-
-
-  # increase sample diversity
   patches_per_image: 300
-
-
   validation_stride: 64
 
-
-
-  # sampling strategy
-
   vessel_center_probability: 0.60
-
   hard_negative_probability: 0.30
-
   random_probability: 0.10
 
-
-
   minimum_vessel_fraction: 0.01
-
-
   hard_negative_max_vessel_fraction: 0.005
-
   hard_negative_candidates: 30
-
-
   max_sampling_attempts: 30
-
 
   include_empty_validation_patches: true
 
+  # ----------------------------------------------------------
+  # D2-S intervention
+  # Applied only to DRIVE training images before patch sampling.
+  # Validation and testing remain unchanged.
+  # ----------------------------------------------------------
 
-  # D2-S: source-only vessel-scale augmentation.
-  # Applied only to DRIVE training images before patch extraction.
-  # Validation and all test datasets remain unchanged.
   scale_augmentation:
     enabled: true
-    probability: 0.80
-    min_scale: 0.65
-    max_scale: 1.50
-
-
+    probability: 0.70
+    min_scale: 0.80
+    max_scale: 1.20
 
 
 # ============================================================
@@ -150,44 +107,29 @@ patch_training:
 # ============================================================
 
 preprocessing:
-
   image_size:
-
     height: 256
     width: 256
 
-
   channels: 3
 
-
   clahe:
-
     enabled: true
-
     clip_limit: 2.0
-
     tile_grid_size: 8
 
-
-
   normalization:
-
     enabled: true
 
     mean:
-
       - 0.485
       - 0.456
       - 0.406
 
-
     std:
-
       - 0.229
       - 0.224
       - 0.225
-
-
 
 
 # ============================================================
@@ -195,43 +137,30 @@ preprocessing:
 # ============================================================
 
 augmentation:
-
   enabled: true
 
-
   horizontal_flip:
-
     enabled: true
     probability: 0.5
-
 
   vertical_flip:
-
     enabled: true
     probability: 0.5
 
-
   rotation:
-
     enabled: true
     limit: 30
     probability: 0.5
 
-
   elastic_transform:
-
     enabled: true
     alpha: 120
     sigma: 6
     probability: 0.3
 
-
   brightness_contrast:
-
     enabled: true
     probability: 0.5
-
-
 
 
 # ============================================================
@@ -239,21 +168,15 @@ augmentation:
 # ============================================================
 
 dataloader:
-
-  # A100 can handle this
-  batch_size: 8
+  # Full-precision training requires more memory than AMP.
+  # Start safely with batch size 4 on a Tesla T4.
+  batch_size: 4
 
   num_workers: 4
-
   pin_memory: true
-
   shuffle: true
-
   drop_last: true
-
   persistent_workers: true
-
-
 
 
 # ============================================================
@@ -261,77 +184,43 @@ dataloader:
 # ============================================================
 
 model:
-
   name: "MV-TransUNet"
 
   input_channels: 3
-
   output_channels: 1
 
-
-
   backbone:
-
     encoder: "resnet50"
-
     pretrained: true
 
-
-
   transformer:
-
     name: "ViT-B_16"
-
     image_size: 256
-
     patch_size: 16
-
     embed_dim: 768
-
     depth: 12
-
     heads: 12
-
     mlp_dim: 3072
-
     dropout: 0.1
 
-
-
   vessel_attention:
-
     enabled: true
-
     reduction_ratio: 16
 
-
-
   decoder:
-
     type: "multi_scale_progressive"
-
     boundary_attention: true
-
     use_skip_connections: true
-
-
     dropout_rate: 0.10
 
-
     channels:
-
       - 512
       - 256
       - 128
       - 64
 
-
-
   deep_supervision:
-
     enabled: true
-
-
 
 
 # ============================================================
@@ -339,27 +228,16 @@ model:
 # ============================================================
 
 loss:
-
   name: "MVTransUNetLoss"
 
-
-
-  # Experiment D balance
-
   focal_tversky_weight: 0.60
-
   boundary_weight: 0.25
-
   cldice_weight: 0.15
 
-
-
   auxiliary_weights:
-
     - 0.10
     - 0.20
     - 0.30
-
 
 
 # ============================================================
@@ -367,23 +245,19 @@ loss:
 # ============================================================
 
 optimizer:
-
   name: "AdamW"
 
-  learning_rate: 0.0001
+  # Reduced from 1e-4 because the previous run developed
+  # progressively increasing non-finite gradient norms.
+  learning_rate: 0.00005
 
   weight_decay: 0.0001
 
-
   betas:
-
     - 0.9
     - 0.999
 
-
   epsilon: 0.00000001
-
-
 
 
 # ============================================================
@@ -391,18 +265,11 @@ optimizer:
 # ============================================================
 
 scheduler:
-
   name: "ReduceLROnPlateau"
-
   factor: 0.5
-
   patience: 8
-
   threshold: 0.0001
-
   min_lr: 0.000001
-
-
 
 
 # ============================================================
@@ -410,29 +277,17 @@ scheduler:
 # ============================================================
 
 training:
-
   epochs: 250
 
-
-  gradient_accumulation_steps: 1
-
-
+  gradient_accumulation_steps: 2
 
   gradient_clipping:
-
     enabled: true
-
     max_norm: 1.0
 
-
-
   early_stopping:
-
     enabled: true
-
     patience: 35
-
-
 
 
 # ============================================================
@@ -440,31 +295,20 @@ training:
 # ============================================================
 
 checkpoint:
+  # New directory ensures that neither the original baseline
+  # nor the unstable D2-S run is overwritten.
+  directory: "checkpoints/d2_s_stable_fp32_seed42"
 
-  # train.py may read directory directly; keep it synchronized with
-  # experiment.name. evaluate.py derives the same path from root_directory.
-  root_directory: "checkpoints"
-  directory: "checkpoints/d2_s_scale_augmentation_seed42"
-
-
+  # Start from clean pretrained initialization.
+  # Do not resume from the unstable run.
   resume: false
-
+  resume_from_best: false
 
   save_last: true
-
   save_best: true
 
-
-  best_model_name:
-
-    "best_model.pth"
-
-
-  last_model_name:
-
-    "last_model.pth"
-
-
+  best_model_name: "best_model.pth"
+  last_model_name: "last_model.pth"
 
 
 # ============================================================
@@ -472,16 +316,18 @@ checkpoint:
 # ============================================================
 
 logging:
-
-  # Unique per experiment to prevent TensorBoard runs from being mixed.
-  root_directory: "logs"
-  directory: "logs/d2_s_scale_augmentation_seed42"
-
+  directory: "logs/d2_s_stable_fp32_seed42"
 
   tensorboard:
-
     enabled: true
 
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+validation:
+  threshold: 0.5
 
 
 # ============================================================
@@ -489,12 +335,17 @@ logging:
 # ============================================================
 
 evaluation:
-
   threshold: 0.5
+  batch_size: 1
 
+  reconstruction:
+    fusion_mode: "hann"
+    minimum_weight: 0.05
+    stride: 64
+    use_tta: false
+    batch_size: 1
 
   metrics:
-
     - dice
     - sensitivity
     - specificity
@@ -502,97 +353,24 @@ evaluation:
     - auc
     - thin_vessel_dice
 
-
-
   test_dataset:
+    image_dir: "datasets_processed/DRIVE_test/images"
+    mask_dir: "datasets_processed/DRIVE_test/masks"
 
-    image_dir:
-
-      "datasets_processed/DRIVE_test/images"
-
-
-    mask_dir:
-
-      "datasets_processed/DRIVE_test/masks"
 
 # ============================================================
-# SAUNA UNCERTAINTY-AWARE SUPERVISION
-# ============================================================
-
-soft_labels:
-  enabled: true
-
-  # Keep the original binary mask for Dice, topology,
-  # boundary, validation, and reported segmentation metrics.
-  preserve_hard_mask: true
-
-  sauna:
-    enabled: true
-
-    # SAUNA generates a signed target in [-1, 1].
-    # A probability-domain copy in [0, 1] is also returned for
-    # compatibility with the current sigmoid segmentation output.
-    return_signed_target: true
-    return_probability_target: true
-
-    # Automatic mask binarization:
-    #   values in [0, 1] use threshold 0.5
-    #   values in [0, 255] use threshold 127.5
-    mask_threshold: null
-
-    # null reproduces the official implementation:
-    # kernel = ceil(maximum foreground distance), made odd.
-    kernel_size: null
-    kernel_ratio: 1.0
-
-    # Matches the official OpenCV SAUNA implementation.
-    distance_mask_size: 5
-    epsilon: 1.0e-6
-
-    # Strict numerical checks during development.
-    validate: true
-
-  # Generate SAUNA before geometric augmentation so the image,
-  # hard mask, and soft target can undergo identical spatial
-  # transformations in the dataset pipeline.
-  generation_stage: before_augmentation
-
-  # The first controlled experiment will add soft supervision
-  # without removing the proven hard-mask objective.
-  supervision:
-    mode: auxiliary
-    target: probability
-
-    # Initial conservative weight. This will later become an
-    # ablation parameter rather than an assumed optimum.
-    weight: 0.20
-
-    # Keep hard-label supervision dominant initially.
-    hard_label_weight: 1.00
-
-    # Do not activate a new loss until the dataset output has
-    # been independently tested.
-    loss_enabled: true
-
-  cache:
-    # On-the-fly generation is acceptable for the small DRIVE
-    # dataset, while avoiding stale targets after augmentation
-    # or preprocessing changes.
-    enabled: false
-
-# ============================================================
-# EXPERIMENT IDENTITY AND OUTPUT ISOLATION
+# EXPERIMENT
 # ============================================================
 
 experiment:
-  # Change this for every controlled run. The checkpoint, log, and
-  # evaluation-output directories must use the same identifier.
-  name: "d2_s_scale_augmentation_seed42"
-
-  output_root_directory: "experiments"
-  output_directory: "experiments/d2_s_scale_augmentation_seed42"
+  name: "d2_s_stable_fp32_seed42"
+  output_directory: "experiments/d2_s_stable_fp32_seed42"
 
   description: >
-    Controlled D2-S experiment: the current DRIVE training protocol plus
-    source-only random vessel-scale augmentation in the range 0.65 to 1.50.
-    Validation and cross-dataset evaluation remain unaugmented; seed 42.
+    Controlled D2-S experiment testing source-only vessel-scale
+    augmentation during DRIVE training. Scale augmentation is applied
+    only to training images before patch sampling. Validation and all
+    test datasets remain unmodified. The scale range is restricted to
+    0.80–1.20, the learning rate is reduced to 5e-5, mixed precision
+    is disabled, and gradient clipping is retained to address the
+    numerical instability observed in the previous run.
