@@ -414,6 +414,42 @@ def build_training_loaders(
                         True,
                     )
                 ),
+                scale_augmentation_enabled=bool(
+                    patch_config.get(
+                        "scale_augmentation",
+                        {},
+                    ).get(
+                        "enabled",
+                        False,
+                    )
+                ),
+                scale_augmentation_probability=float(
+                    patch_config.get(
+                        "scale_augmentation",
+                        {},
+                    ).get(
+                        "probability",
+                        0.80,
+                    )
+                ),
+                scale_augmentation_min=float(
+                    patch_config.get(
+                        "scale_augmentation",
+                        {},
+                    ).get(
+                        "min_scale",
+                        0.65,
+                    )
+                ),
+                scale_augmentation_max=float(
+                    patch_config.get(
+                        "scale_augmentation",
+                        {},
+                    ).get(
+                        "max_scale",
+                        1.50,
+                    )
+                ),
             )
         )
 
@@ -1090,6 +1126,27 @@ def main() -> None:
                 0.01,
             ),
         )
+
+        scale_config = patch_config.get(
+            "scale_augmentation",
+            {},
+        )
+
+        print(
+            "Source-only scale augmentation:",
+            bool(scale_config.get("enabled", False)),
+        )
+
+        if bool(scale_config.get("enabled", False)):
+            print(
+                "Scale probability:",
+                float(scale_config.get("probability", 0.80)),
+            )
+            print(
+                "Scale range:",
+                f"{float(scale_config.get('min_scale', 0.65)):.2f}–"
+                f"{float(scale_config.get('max_scale', 1.50)):.2f}",
+            )
 
     # --------------------------------------------------------
     # MODEL

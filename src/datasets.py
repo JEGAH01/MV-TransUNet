@@ -66,23 +66,91 @@ def seed_worker(worker_id: int) -> None:
 
 
 class CLAHEEnhancement:
-    def __init__(self, clip_limit: float = 2.0, tile_grid_size: int = 8) -> None:
-        self.clahe = cv2.createCLAHE(
-            clipLimit=float(clip_limit),
-            tileGridSize=(int(tile_grid_size), int(tile_grid_size)),
-        )
+    """
+    Pickle-safe CLAHE wrapper.
+
+    OpenCV's cv2.CLAHE object cannot be pickled. Windows DataLoader workers
+    use the multiprocessing "spawn" method, which requires the Dataset and
+    every object stored inside it to be pickleable.
+
+    This wrapper stores only primitive CLAHE settings and lazily creates the
+    OpenCV CLAHE object inside the process that actually uses it. Therefore,
+    it works with num_workers > 0 on Windows while preserving the same CLAHE
+    preprocessing behaviour on Linux and Google Colab.
+    """
+
+    def __init__(
+        self,
+        clip_limit: float = 2.0,
+        tile_grid_size: int = 8,
+    ) -> None:
+        self.clip_limit = float(clip_limit)
+        self.tile_grid_size = int(tile_grid_size)
+
+        if self.clip_limit <= 0.0:
+            raise ValueError("CLAHE clip_limit must be greater than zero.")
+        if self.tile_grid_size < 1:
+            raise ValueError("CLAHE tile_grid_size must be at least 1.")
+
+        self._clahe = None
+
+    def _get_clahe(self):
+        """Create one CLAHE instance lazily per process."""
+        if self._clahe is None:
+            self._clahe = cv2.createCLAHE(
+                clipLimit=self.clip_limit,
+                tileGridSize=(
+                    self.tile_grid_size,
+                    self.tile_grid_size,
+                ),
+            )
+        return self._clahe
+
+    def __getstate__(self):
+        """Remove the non-pickleable OpenCV object before serialization."""
+        state = self.__dict__.copy()
+        state["_clahe"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Restore settings; CLAHE is recreated lazily in the worker."""
+        self.__dict__.update(state)
+        self._clahe = None
 
     def __call__(self, image: np.ndarray) -> np.ndarray:
         if image is None:
             raise ValueError("CLAHE received an empty image.")
-        if image.ndim != 3 or image.shape[2] != 3:
-            raise ValueError("CLAHE expects an RGB image with three channels.")
-        lab_image = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab_image)
-        enhanced_l_channel = self.clahe.apply(l_channel)
-        enhanced_lab = cv2.merge([enhanced_l_channel, a_channel, b_channel])
-        return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
 
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                "CLAHE expects an RGB image with three channels."
+            )
+
+        lab_image = cv2.cvtColor(
+            image,
+            cv2.COLOR_RGB2LAB,
+        )
+
+        l_channel, a_channel, b_channel = cv2.split(
+            lab_image
+        )
+
+        enhanced_l_channel = self._get_clahe().apply(
+            l_channel
+        )
+
+        enhanced_lab = cv2.merge(
+            [
+                enhanced_l_channel,
+                a_channel,
+                b_channel,
+            ]
+        )
+
+        return cv2.cvtColor(
+            enhanced_lab,
+            cv2.COLOR_LAB2RGB,
+        )
 
 def get_train_transform(image_size: int = 256) -> A.Compose:
     return A.Compose([
@@ -250,6 +318,59 @@ def pad_to_minimum_size(
     return image, mask
 
 
+def random_scale_image_and_mask(
+    image: np.ndarray,
+    mask: np.ndarray,
+    minimum_scale: float,
+    maximum_scale: float,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Randomly rescale an image-mask pair while preserving alignment.
+
+    The image uses bilinear interpolation and the binary mask uses nearest-
+    neighbour interpolation. The returned arrays are contiguous so they are
+    safe for OpenCV, Albumentations, and PyTorch worker processes.
+    """
+    minimum_scale = float(minimum_scale)
+    maximum_scale = float(maximum_scale)
+
+    if minimum_scale <= 0.0 or maximum_scale <= 0.0:
+        raise ValueError("Scale limits must be greater than zero.")
+    if minimum_scale > maximum_scale:
+        raise ValueError(
+            "minimum_scale cannot be greater than maximum_scale."
+        )
+    if image.shape[:2] != mask.shape[:2]:
+        raise ValueError(
+            "Image and mask must have matching spatial dimensions before scaling."
+        )
+
+    scale_factor = float(
+        np.random.uniform(minimum_scale, maximum_scale)
+    )
+
+    source_height, source_width = mask.shape
+    scaled_height = max(1, int(round(source_height * scale_factor)))
+    scaled_width = max(1, int(round(source_width * scale_factor)))
+
+    scaled_image = cv2.resize(
+        image,
+        dsize=(scaled_width, scaled_height),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    scaled_mask = cv2.resize(
+        mask.astype(np.float32),
+        dsize=(scaled_width, scaled_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    scaled_mask = (scaled_mask > 0.5).astype(np.float32)
+
+    return (
+        np.ascontiguousarray(scaled_image),
+        np.ascontiguousarray(scaled_mask),
+        scale_factor,
+    )
+
+
 def crop_patch(
     image: np.ndarray,
     mask: np.ndarray,
@@ -375,6 +496,10 @@ class RandomPatchRetinalDataset(Dataset):
         clahe: bool = True,
         clahe_clip_limit: float = 2.0,
         clahe_tile_grid_size: int = 8,
+        scale_augmentation_enabled: bool = False,
+        scale_augmentation_probability: float = 0.80,
+        scale_augmentation_min: float = 0.65,
+        scale_augmentation_max: float = 1.50,
     ) -> None:
         super().__init__()
 
@@ -422,6 +547,19 @@ class RandomPatchRetinalDataset(Dataset):
         if max_sampling_attempts < 1:
             raise ValueError("max_sampling_attempts must be at least 1.")
 
+        if not 0.0 <= float(scale_augmentation_probability) <= 1.0:
+            raise ValueError(
+                "scale_augmentation_probability must be between 0 and 1."
+            )
+        if float(scale_augmentation_min) <= 0.0:
+            raise ValueError("scale_augmentation_min must be greater than zero.")
+        if float(scale_augmentation_max) <= 0.0:
+            raise ValueError("scale_augmentation_max must be greater than zero.")
+        if float(scale_augmentation_min) > float(scale_augmentation_max):
+            raise ValueError(
+                "scale_augmentation_min cannot exceed scale_augmentation_max."
+            )
+
         self.model_input_size = int(model_input_size)
         self.patches_per_image = int(patches_per_image)
         self.vessel_center_probability = float(vessel_center_probability)
@@ -433,6 +571,12 @@ class RandomPatchRetinalDataset(Dataset):
         )
         self.hard_negative_candidates = int(hard_negative_candidates)
         self.max_sampling_attempts = int(max_sampling_attempts)
+        self.scale_augmentation_enabled = bool(scale_augmentation_enabled)
+        self.scale_augmentation_probability = float(
+            scale_augmentation_probability
+        )
+        self.scale_augmentation_min = float(scale_augmentation_min)
+        self.scale_augmentation_max = float(scale_augmentation_max)
 
         self.transform = (
             transform
@@ -703,9 +847,23 @@ class RandomPatchRetinalDataset(Dataset):
 
         image_path, mask_path = self.samples[image_index]
         
-        # Directly extract from RAM memory instead of loading from disk
-        image = self.cached_images[image_index]
-        mask = self.cached_masks[image_index]
+        # Copy cached arrays because source-only scaling must never mutate RAM cache.
+        image = self.cached_images[image_index].copy()
+        mask = self.cached_masks[image_index].copy()
+
+        scale_applied = False
+        scale_factor = 1.0
+        if (
+            self.scale_augmentation_enabled
+            and float(np.random.random()) < self.scale_augmentation_probability
+        ):
+            image, mask, scale_factor = random_scale_image_and_mask(
+                image=image,
+                mask=mask,
+                minimum_scale=self.scale_augmentation_min,
+                maximum_scale=self.scale_augmentation_max,
+            )
+            scale_applied = True
 
         image, mask = pad_to_minimum_size(
             image,
@@ -743,6 +901,8 @@ class RandomPatchRetinalDataset(Dataset):
             "edge_energy": edge_energy,
             "vessel_centred": sample_type == "vessel",
             "hard_negative": sample_type == "hard_negative",
+            "scale_augmentation_applied": scale_applied,
+            "scale_factor": float(scale_factor),
         }
 
 
@@ -951,8 +1111,11 @@ def build_dataloaders(
     pin_memory: bool = True,
     persistent_workers: bool = False,
     drop_last: bool = False,
+    soft_labels_config: Optional[Dict] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """Original whole-image loaders, retained for ablations."""
+
+    del soft_labels_config
 
     samples = load_sample_pairs(image_dir, mask_dir)
     training_samples, validation_samples = split_sample_pairs(
@@ -1008,6 +1171,11 @@ def build_patch_dataloaders(
     persistent_workers: bool = False,
     drop_last: bool = False,
     include_empty_validation_patches: bool = True,
+    scale_augmentation_enabled: bool = False,
+    scale_augmentation_probability: float = 0.80,
+    scale_augmentation_min: float = 0.65,
+    scale_augmentation_max: float = 1.50,
+    soft_labels_config: Optional[Dict] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build patch-based training and deterministic validation loaders.
@@ -1039,7 +1207,15 @@ def build_patch_dataloaders(
         max_sampling_attempts=max_sampling_attempts,
         transform=get_train_transform(model_input_size),
         clahe=clahe,
+        scale_augmentation_enabled=scale_augmentation_enabled,
+        scale_augmentation_probability=scale_augmentation_probability,
+        scale_augmentation_min=scale_augmentation_min,
+        scale_augmentation_max=scale_augmentation_max,
     )
+
+    # Reserved for compatibility with training configurations that expose
+    # soft-label options. This geometric ablation keeps binary masks unchanged.
+    del soft_labels_config
 
     validation_dataset = GridPatchRetinalDataset(
         samples=validation_samples,
@@ -1083,6 +1259,10 @@ def build_all_training_patch_loader(
     pin_memory: bool = True,
     persistent_workers: bool = False,
     drop_last: bool = False,
+    scale_augmentation_enabled: bool = False,
+    scale_augmentation_probability: float = 0.80,
+    scale_augmentation_min: float = 0.65,
+    scale_augmentation_max: float = 1.50,
 ) -> DataLoader:
     """Build a patch loader from all official DRIVE training images."""
 
@@ -1103,6 +1283,10 @@ def build_all_training_patch_loader(
         max_sampling_attempts=max_sampling_attempts,
         transform=get_train_transform(model_input_size),
         clahe=clahe,
+        scale_augmentation_enabled=scale_augmentation_enabled,
+        scale_augmentation_probability=scale_augmentation_probability,
+        scale_augmentation_min=scale_augmentation_min,
+        scale_augmentation_max=scale_augmentation_max,
     )
     return create_dataloader(
         dataset, batch_size, True, num_workers,
@@ -1255,6 +1439,11 @@ def verify_patch_pipeline(
         print("Training sample types:", train_batch["sample_type"])
         print("Training vessel fractions:", train_batch["vessel_fraction"])
         print("Training edge energies:", train_batch["edge_energy"])
+        print("Training scale factors:", train_batch["scale_factor"])
+        print(
+            "Scale augmentation applied:",
+            train_batch["scale_augmentation_applied"],
+        )
         return True
     except Exception as error:
         print("Patch Pipeline Error:")

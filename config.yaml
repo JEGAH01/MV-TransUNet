@@ -17,7 +17,7 @@
 
 project:
   name: "MV-TransUNet"
-  version: "Experiment_D"
+  version: "D2_S_Scale_Augmentation"
   task: "retinal_vessel_segmentation"
 
 
@@ -61,10 +61,10 @@ dataset:
     name: "DRIVE_train"
 
     image_dir:
-      "/content/MV-TransUNet/datasets_processed/DRIVE_train/images"
+      "datasets_processed/DRIVE_train/images"
 
     mask_dir:
-      "/content/MV-TransUNet/datasets_processed/DRIVE_train/masks"
+      "datasets_processed/DRIVE_train/masks"
 
 
 
@@ -73,10 +73,10 @@ dataset:
     name: "DRIVE_test"
 
     image_dir:
-      "/content/MV-TransUNet/datasets_processed/DRIVE_test/images"
+      "datasets_processed/DRIVE_test/images"
 
     mask_dir:
-      "/content/MV-TransUNet/datasets_processed/DRIVE_test/masks"
+      "datasets_processed/DRIVE_test/masks"
 
 
 
@@ -131,6 +131,16 @@ patch_training:
 
 
   include_empty_validation_patches: true
+
+
+  # D2-S: source-only vessel-scale augmentation.
+  # Applied only to DRIVE training images before patch extraction.
+  # Validation and all test datasets remain unchanged.
+  scale_augmentation:
+    enabled: true
+    probability: 0.80
+    min_scale: 0.65
+    max_scale: 1.50
 
 
 
@@ -431,9 +441,10 @@ training:
 
 checkpoint:
 
-  directory:
-
-    "/content/MV-TransUNet/checkpoints/experiment_D"
+  # train.py may read directory directly; keep it synchronized with
+  # experiment.name. evaluate.py derives the same path from root_directory.
+  root_directory: "checkpoints"
+  directory: "checkpoints/d2_s_scale_augmentation_seed42"
 
 
   resume: false
@@ -462,9 +473,9 @@ checkpoint:
 
 logging:
 
-  directory:
-
-    "/content/MV-TransUNet/logs/experiment_D"
+  # Unique per experiment to prevent TensorBoard runs from being mixed.
+  root_directory: "logs"
+  directory: "logs/d2_s_scale_augmentation_seed42"
 
 
   tensorboard:
@@ -497,31 +508,91 @@ evaluation:
 
     image_dir:
 
-      "/content/MV-TransUNet/datasets_processed/DRIVE_test/images"
+      "datasets_processed/DRIVE_test/images"
 
 
     mask_dir:
 
-      "/content/MV-TransUNet/datasets_processed/DRIVE_test/masks"
-
-
+      "datasets_processed/DRIVE_test/masks"
 
 # ============================================================
-# EXPERIMENT NAME
+# SAUNA UNCERTAINTY-AWARE SUPERVISION
+# ============================================================
+
+soft_labels:
+  enabled: true
+
+  # Keep the original binary mask for Dice, topology,
+  # boundary, validation, and reported segmentation metrics.
+  preserve_hard_mask: true
+
+  sauna:
+    enabled: true
+
+    # SAUNA generates a signed target in [-1, 1].
+    # A probability-domain copy in [0, 1] is also returned for
+    # compatibility with the current sigmoid segmentation output.
+    return_signed_target: true
+    return_probability_target: true
+
+    # Automatic mask binarization:
+    #   values in [0, 1] use threshold 0.5
+    #   values in [0, 255] use threshold 127.5
+    mask_threshold: null
+
+    # null reproduces the official implementation:
+    # kernel = ceil(maximum foreground distance), made odd.
+    kernel_size: null
+    kernel_ratio: 1.0
+
+    # Matches the official OpenCV SAUNA implementation.
+    distance_mask_size: 5
+    epsilon: 1.0e-6
+
+    # Strict numerical checks during development.
+    validate: true
+
+  # Generate SAUNA before geometric augmentation so the image,
+  # hard mask, and soft target can undergo identical spatial
+  # transformations in the dataset pipeline.
+  generation_stage: before_augmentation
+
+  # The first controlled experiment will add soft supervision
+  # without removing the proven hard-mask objective.
+  supervision:
+    mode: auxiliary
+    target: probability
+
+    # Initial conservative weight. This will later become an
+    # ablation parameter rather than an assumed optimum.
+    weight: 0.20
+
+    # Keep hard-label supervision dominant initially.
+    hard_label_weight: 1.00
+
+    # Do not activate a new loss until the dataset output has
+    # been independently tested.
+    loss_enabled: true
+
+  cache:
+    # On-the-fly generation is acceptable for the small DRIVE
+    # dataset, while avoiding stale targets after augmentation
+    # or preprocessing changes.
+    enabled: false
+
+# ============================================================
+# EXPERIMENT IDENTITY AND OUTPUT ISOLATION
 # ============================================================
 
 experiment:
+  # Change this for every controlled run. The checkpoint, log, and
+  # evaluation-output directories must use the same identifier.
+  name: "d2_s_scale_augmentation_seed42"
 
-  name:
+  output_root_directory: "experiments"
+  output_directory: "experiments/d2_s_scale_augmentation_seed42"
 
-    "MVTransUNet_Experiment_D_128Patch_300Samples"
-
-
-  description:
-
-    >
-    Experiment D:
-    Improved generalization using dense patch sampling,
-    vessel-focused 128px crops, hard-negative mining,
-    Focal Tversky + Boundary + clDice optimization,
-    A100 training protocol.
+  description: >
+    Controlled D2-S experiment: the current DRIVE training protocol plus
+    source-only random vessel-scale augmentation in the range 0.65 to 1.50.
+    Validation and cross-dataset evaluation remain unaugmented; seed 42.
