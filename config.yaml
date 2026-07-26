@@ -1,268 +1,115 @@
-# ============================================================
-# MV-TransUNet D2-S Configuration
-# Source-Only Vessel-Scale Augmentation
-#
-# Scientific objective:
-# Test whether vessel-scale augmentation learned from DRIVE
-# improves zero-shot cross-dataset generalization.
-#
-# Training:
-# - DRIVE_train only
-# - DRIVE validation used for model selection
-# - DRIVE_test reserved for final evaluation
-# - STARE, CHASE_DB1, and HRF remain zero-shot test datasets
-# ============================================================
-
-
 project:
-  name: "MV-TransUNet"
-  version: "D2_S_Scale_Augmentation_Stable"
+  name: "MV-TransUNet++"
+  version: "Topology_A2_BranchOnly"
   task: "retinal_vessel_segmentation"
-
 
 seed:
   value: 42
   deterministic: true
 
-
-# ============================================================
-# HARDWARE
-# ============================================================
-
 hardware:
   device: "cuda"
-  accelerator: "google_colab"
-  gpu_type: "NVIDIA_T4"
-
-  # Disable AMP for this diagnostic/stable run.
-  # The previous run developed repeated non-finite gradients.
-  mixed_precision: false
-
-  # Deterministic mode takes priority.
+  mixed_precision: true
   cudnn_benchmark: false
-
-
-# ============================================================
-# DATASET
-# ============================================================
 
 dataset:
   name: "DRIVE"
-
-  raw_root_dir: "datasets"
-  processed_root_dir: "datasets_processed"
-
   train_dataset:
     name: "DRIVE_train"
-    image_dir: "datasets_processed/DRIVE_train/images"
-    mask_dir: "datasets_processed/DRIVE_train/masks"
-
-  test_dataset:
-    name: "DRIVE_test"
-    image_dir: "datasets_processed/DRIVE_test/images"
-    mask_dir: "datasets_processed/DRIVE_test/masks"
-
+    image_dir: "datasets/DRIVE/training/image"
+    mask_dir: "datasets/DRIVE/training/1st_manual"
   validation_ratio: 0.20
   split_seed: 42
 
-
-# ============================================================
-# PATCH TRAINING
-# ============================================================
+topology:
+  enabled: true
+  target_root: "datasets_topology/DRIVE_train"
 
 patch_training:
   enabled: true
-
-  patch_size: 128
+  patch_size: 256
   model_input_size: 256
-  patches_per_image: 300
-  validation_stride: 64
-
+  patches_per_image: 100
+  validation_stride: 128
   vessel_center_probability: 0.60
-  hard_negative_probability: 0.30
-  random_probability: 0.10
-
+  hard_negative_probability: 0.25
+  random_probability: 0.15
   minimum_vessel_fraction: 0.01
   hard_negative_max_vessel_fraction: 0.005
-  hard_negative_candidates: 30
-  max_sampling_attempts: 30
-
+  hard_negative_candidates: 20
+  max_sampling_attempts: 20
   include_empty_validation_patches: true
-
-  # ----------------------------------------------------------
-  # D2-S intervention
-  # Applied only to DRIVE training images before patch sampling.
-  # Validation and testing remain unchanged.
-  # ----------------------------------------------------------
-
-  scale_augmentation:
-    enabled: true
-    probability: 0.70
-    min_scale: 0.80
-    max_scale: 1.20
-
-
-# ============================================================
-# PREPROCESSING
-# ============================================================
 
 preprocessing:
   image_size:
     height: 256
     width: 256
-
   channels: 3
-
   clahe:
     enabled: true
-    clip_limit: 2.0
-    tile_grid_size: 8
-
-  normalization:
-    enabled: true
-
-    mean:
-      - 0.485
-      - 0.456
-      - 0.406
-
-    std:
-      - 0.229
-      - 0.224
-      - 0.225
-
-
-# ============================================================
-# AUGMENTATION
-# ============================================================
 
 augmentation:
   enabled: true
-
-  horizontal_flip:
-    enabled: true
-    probability: 0.5
-
-  vertical_flip:
-    enabled: true
-    probability: 0.5
-
-  rotation:
-    enabled: true
-    limit: 30
-    probability: 0.5
-
-  elastic_transform:
-    enabled: true
-    alpha: 120
-    sigma: 6
-    probability: 0.3
-
-  brightness_contrast:
-    enabled: true
-    probability: 0.5
-
-
-# ============================================================
-# DATALOADER
-# ============================================================
+  note: "Topology datasets apply synchronized geometric augmentation internally."
 
 dataloader:
-  # Full-precision training requires more memory than AMP.
-  # Start safely with batch size 4 on a Tesla T4.
-  batch_size: 4
-
-  num_workers: 4
+  batch_size: 2
+  num_workers: 0
   pin_memory: true
   shuffle: true
-  drop_last: true
-  persistent_workers: true
-
-
-# ============================================================
-# MODEL
-# ============================================================
+  drop_last: false
+  persistent_workers: false
 
 model:
-  name: "MV-TransUNet"
-
+  name: "MVTransUNetTopology"
   input_channels: 3
   output_channels: 1
-
   backbone:
     encoder: "resnet50"
     pretrained: true
-
   transformer:
-    name: "ViT-B_16"
-    image_size: 256
-    patch_size: 16
     embed_dim: 768
-    depth: 12
-    heads: 12
-    mlp_dim: 3072
-    dropout: 0.1
-
   vessel_attention:
-    enabled: true
     reduction_ratio: 16
-
   decoder:
-    type: "multi_scale_progressive"
-    boundary_attention: true
-    use_skip_connections: true
     dropout_rate: 0.10
-
-    channels:
-      - 512
-      - 256
-      - 128
-      - 64
-
   deep_supervision:
     enabled: true
+  topology_branch:
+    topology_channels: 128
+    branch_channels: 32
+    head_hidden_channels: 64
+    refinement_blocks: 2
+    fusion_dropout: 0.10
+    head_dropout: 0.0
 
-
-# ============================================================
-# LOSS
-# ============================================================
-
-loss:
-  name: "MVTransUNetLoss"
-
-  focal_tversky_weight: 0.60
-  boundary_weight: 0.25
-  cldice_weight: 0.15
-
-  auxiliary_weights:
-    - 0.10
-    - 0.20
-    - 0.30
-
-
-# ============================================================
-# OPTIMIZER
-# ============================================================
+topology_loss:
+  name: "MVTransUNetTopologyLoss"
+  segmentation_weight: 1.00
+  cldice_weight: 0.00
+  skeleton_weight: 0.00
+  endpoint_weight: 0.00
+  junction_weight: 0.00
+  auxiliary_weight: 0.20
+  baseline_weight: 0.10
+  segmentation_bce_weight: 0.50
+  segmentation_dice_weight: 0.50
+  skeleton_bce_weight: 0.50
+  skeleton_dice_weight: 0.50
+  node_bce_weight: 0.50
+  node_focal_weight: 0.50
+  node_maximum_positive_weight: 50.0
+  node_focal_alpha: 0.75
+  node_focal_gamma: 2.0
+  cldice_iterations: 10
+  auxiliary_stage_weights: [0.25, 0.50, 0.75]
 
 optimizer:
   name: "AdamW"
-
-  # Reduced from 1e-4 because the previous run developed
-  # progressively increasing non-finite gradient norms.
   learning_rate: 0.00005
-
   weight_decay: 0.0001
-
-  betas:
-    - 0.9
-    - 0.999
-
+  betas: [0.9, 0.999]
   epsilon: 0.00000001
-
-
-# ============================================================
-# SCHEDULER
-# ============================================================
 
 scheduler:
   name: "ReduceLROnPlateau"
@@ -271,106 +118,29 @@ scheduler:
   threshold: 0.0001
   min_lr: 0.000001
 
-
-# ============================================================
-# TRAINING
-# ============================================================
-
 training:
-  epochs: 250
-
+  epochs: 200
   gradient_accumulation_steps: 2
-
   gradient_clipping:
     enabled: true
     max_norm: 1.0
-
   early_stopping:
     enabled: true
     patience: 35
 
-
-# ============================================================
-# CHECKPOINT
-# ============================================================
-
 checkpoint:
-  # New directory ensures that neither the original baseline
-  # nor the unstable D2-S run is overwritten.
-  directory: "checkpoints/d2_s_stable_fp32_seed42"
-
-  # Start from clean pretrained initialization.
-  # Do not resume from the unstable run.
+  directory: "checkpoints/topology_branch_only_seed42"
   resume: false
   resume_from_best: false
-
   save_last: true
   save_best: true
-
   best_model_name: "best_model.pth"
   last_model_name: "last_model.pth"
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
 logging:
-  directory: "logs/d2_s_stable_fp32_seed42"
-
+  directory: "logs/topology_branch_only_seed42"
   tensorboard:
     enabled: true
 
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
 validation:
   threshold: 0.5
-
-
-# ============================================================
-# EVALUATION
-# ============================================================
-
-evaluation:
-  threshold: 0.5
-  batch_size: 1
-
-  reconstruction:
-    fusion_mode: "hann"
-    minimum_weight: 0.05
-    stride: 64
-    use_tta: false
-    batch_size: 1
-
-  metrics:
-    - dice
-    - sensitivity
-    - specificity
-    - accuracy
-    - auc
-    - thin_vessel_dice
-
-  test_dataset:
-    image_dir: "datasets_processed/DRIVE_test/images"
-    mask_dir: "datasets_processed/DRIVE_test/masks"
-
-
-# ============================================================
-# EXPERIMENT
-# ============================================================
-
-experiment:
-  name: "d2_s_stable_fp32_seed42"
-  output_directory: "experiments/d2_s_stable_fp32_seed42"
-
-  description: >
-    Controlled D2-S experiment testing source-only vessel-scale
-    augmentation during DRIVE training. Scale augmentation is applied
-    only to training images before patch sampling. Validation and all
-    test datasets remain unmodified. The scale range is restricted to
-    0.80–1.20, the learning rate is reduced to 5e-5, mixed precision
-    is disabled, and gradient clipping is retained to address the
-    numerical instability observed in the previous run.
