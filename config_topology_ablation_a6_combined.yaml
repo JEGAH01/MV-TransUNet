@@ -1,0 +1,170 @@
+project:
+  name: "MV-TransUNet++"
+  version: "Topology_A6_Combined_WidthAdaptive_ScaleAugmentation"
+  task: "retinal_vessel_segmentation"
+
+seed:
+  value: 42
+  deterministic: true
+
+hardware:
+  device: "cuda"
+  mixed_precision: true
+  cudnn_benchmark: false
+
+dataset:
+  name: "DRIVE"
+  train_dataset:
+    name: "DRIVE_train"
+    image_dir: "datasets/DRIVE/training/image"
+    mask_dir: "datasets/DRIVE/training/1st_manual"
+  validation_ratio: 0.20
+  split_seed: 42
+
+topology:
+  enabled: true
+  target_root: "datasets_topology/DRIVE_train"
+
+patch_training:
+  enabled: true
+  patch_size: 256
+  model_input_size: 256
+  patches_per_image: 100
+  validation_stride: 128
+  vessel_center_probability: 0.60
+  hard_negative_probability: 0.25
+  random_probability: 0.15
+  minimum_vessel_fraction: 0.01
+  hard_negative_max_vessel_fraction: 0.005
+  hard_negative_candidates: 20
+  max_sampling_attempts: 20
+  include_empty_validation_patches: true
+
+  # DRIVE-to-target vessel-scale gap augmentation. Matched with
+  # config_baseline_matched_topology_scaleaug_seed42.yaml. Conservative range
+  # chosen well below the raw Frangi-sigma ratio measured between DRIVE
+  # (weighted median sigma 1.8750) and CHASE_DB1/HRF (8.4821 / 9.8778
+  # respectively, from src/calibrate_vessel_scale.py) to avoid the instability
+  # documented in config_topology_backup.yaml and to avoid destroying thin
+  # single-pixel skeleton/endpoint/junction targets under extreme downsampling.
+  # Applied only to the training dataset (RandomPatchTopologyDataset); the
+  # validation grid dataset is unaffected, so evaluation stays identical.
+  scale_augmentation:
+    enabled: true
+    probability: 0.8
+    min_scale: 0.75
+    max_scale: 2.0
+
+preprocessing:
+  image_size:
+    height: 256
+    width: 256
+  channels: 3
+  clahe:
+    enabled: true
+
+augmentation:
+  enabled: true
+  note: "Topology datasets apply synchronized geometric augmentation internally."
+
+dataloader:
+  batch_size: 2
+  num_workers: 0
+  pin_memory: true
+  shuffle: true
+  drop_last: false
+  persistent_workers: false
+
+model:
+  name: "MVTransUNetTopology"
+  input_channels: 3
+  output_channels: 1
+  backbone:
+    encoder: "resnet50"
+    pretrained: true
+  transformer:
+    embed_dim: 768
+  vessel_attention:
+    reduction_ratio: 16
+  decoder:
+    dropout_rate: 0.10
+  deep_supervision:
+    enabled: true
+  topology_branch:
+    topology_channels: 128
+    branch_channels: 32
+    head_hidden_channels: 64
+    refinement_blocks: 2
+    fusion_dropout: 0.10
+    head_dropout: 0.0
+
+topology_loss:
+  name: "MVTransUNetTopologyLoss"
+  segmentation_weight: 1.00
+  cldice_weight: 0.30
+  skeleton_weight: 0.30
+  endpoint_weight: 0.10
+  junction_weight: 0.10
+  auxiliary_weight: 0.20
+  baseline_weight: 0.10
+  segmentation_bce_weight: 0.50
+  segmentation_dice_weight: 0.50
+  skeleton_bce_weight: 0.50
+  skeleton_dice_weight: 0.50
+  node_bce_weight: 0.50
+  node_focal_weight: 0.50
+  node_maximum_positive_weight: 50.0
+  node_focal_alpha: 0.75
+  node_focal_gamma: 2.0
+  cldice_iterations: 10
+  auxiliary_stage_weights: [0.25, 0.50, 0.75]
+  # A4's width-adaptive segmentation/skeleton loss weighting, combined
+  # here with A5's scale augmentation (patch_training.scale_augmentation
+  # above). Identical parameters to config_topology_ablation_a4_width_adaptive.yaml.
+  use_width_adaptive_weighting: true
+  width_adaptive_apply_to_segmentation: true
+  width_adaptive_apply_to_skeleton: true
+  width_adaptive_reference_width: 3.0
+  width_adaptive_maximum_weight: 5.0
+  width_adaptive_epsilon: 0.001
+
+optimizer:
+  name: "AdamW"
+  learning_rate: 0.00005
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  epsilon: 0.00000001
+
+scheduler:
+  name: "ReduceLROnPlateau"
+  factor: 0.5
+  patience: 8
+  threshold: 0.0001
+  min_lr: 0.000001
+
+training:
+  epochs: 200
+  gradient_accumulation_steps: 2
+  gradient_clipping:
+    enabled: true
+    max_norm: 1.0
+  early_stopping:
+    enabled: true
+    patience: 35
+
+checkpoint:
+  directory: "checkpoints/topology_a6_combined_seed42"
+  resume: false
+  resume_from_best: false
+  save_last: true
+  save_best: true
+  best_model_name: "best_model.pth"
+  last_model_name: "last_model.pth"
+
+logging:
+  directory: "logs/topology_a6_combined_seed42"
+  tensorboard:
+    enabled: true
+
+validation:
+  threshold: 0.5

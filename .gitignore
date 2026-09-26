@@ -55,3 +55,35 @@ experiments/
 
 .DS_Store
 Thumbs.db
+
+# Generated topology targets
+datasets_topology/
+
+# Datasets
+datasets/
+datasets_processed/
+
+# Training artifacts
+checkpoints/
+logs/
+runs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local environments
+.env
+.venv/
+env/
+# Local archive of superseded/scratch files (not part of the public release)
+_archive/
+
+# Generated analysis/evaluation outputs (regenerable; small result CSVs stay tracked at repo root)
+cache/
+evaluation_outputs/
+analysis_outputs/
+analysis/
+
+# Editor config
+.vscode/

@@ -138,6 +138,7 @@ class MVTransUNetTopology(MVTransUNet):
         topology_refinement_blocks: int = 2,
         topology_fusion_dropout: float = 0.1,
         topology_head_dropout: float = 0.0,
+        vessel_attention_scale_conditioning: bool = False,
     ) -> None:
         super().__init__(
             pretrained=pretrained,
@@ -146,6 +147,9 @@ class MVTransUNetTopology(MVTransUNet):
             output_channels=output_channels,
             deep_supervision=deep_supervision,
             decoder_dropout_rate=decoder_dropout_rate,
+            vessel_attention_scale_conditioning=(
+                vessel_attention_scale_conditioning
+            ),
         )
 
         if output_channels != 1:
@@ -350,6 +354,7 @@ class MVTransUNetTopology(MVTransUNet):
         x: torch.Tensor,
         return_topology: bool | None = None,
         return_auxiliary: bool = False,
+        scale_ratio: torch.Tensor | float | None = None,
     ) -> Union[
         torch.Tensor,
         TopologyModelOutput,
@@ -387,6 +392,13 @@ class MVTransUNetTopology(MVTransUNet):
             Preserve the interface of the original MV-TransUNet. When true,
             the complete dictionary is returned so auxiliary predictions are
             accessible.
+
+        scale_ratio:
+            Optional per-sample scale-conditioning signal for the Vessel
+            Attention Module, with shape [B] (or a Python float, broadcast
+            to every sample in the batch). Ignored unless the model was
+            constructed with vessel_attention_scale_conditioning=True, in
+            which case it defaults to 1.0 (no scale change) when omitted.
         """
 
         self._validate_input(x)
@@ -411,8 +423,16 @@ class MVTransUNetTopology(MVTransUNet):
             "skip3"
         ]
 
+        if isinstance(scale_ratio, (int, float)):
+            scale_ratio = torch.full(
+                (transformer_feature.shape[0],),
+                float(scale_ratio),
+                device=transformer_feature.device,
+            )
+
         transformer_feature = self.vessel_attention(
-            transformer_feature
+            transformer_feature,
+            scale_ratio=scale_ratio,
         )
 
         # Always request the decoder's rich dictionary because the topology
@@ -482,6 +502,7 @@ def build_mv_transunet_topology(
     topology_refinement_blocks: int = 2,
     topology_fusion_dropout: float = 0.1,
     topology_head_dropout: float = 0.0,
+    vessel_attention_scale_conditioning: bool = False,
 ) -> MVTransUNetTopology:
     """Build the parallel topology-aware MV-TransUNet model."""
 
@@ -502,6 +523,9 @@ def build_mv_transunet_topology(
         ),
         topology_fusion_dropout=topology_fusion_dropout,
         topology_head_dropout=topology_head_dropout,
+        vessel_attention_scale_conditioning=(
+            vessel_attention_scale_conditioning
+        ),
     )
 
 

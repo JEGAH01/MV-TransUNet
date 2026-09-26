@@ -1,0 +1,148 @@
+project:
+  name: "MV-TransUNet"
+  version: "Baseline_Matched_Topology_ScaleAugV2_Seed42"
+  task: "retinal_vessel_segmentation"
+  experiment: "strict_matched_topology_control_scale_augmentation_v2_reduced"
+
+seed:
+  value: 42
+  deterministic: true
+
+hardware:
+  device: "cuda"
+  mixed_precision: true
+  cudnn_benchmark: false
+
+dataset:
+  name: "DRIVE"
+  train_dataset:
+    name: "DRIVE_train"
+    image_dir: "datasets/DRIVE/training/image"
+    mask_dir: "datasets/DRIVE/training/1st_manual"
+  validation_ratio: 0.20
+  split_seed: 42
+
+patch_training:
+  enabled: true
+  patch_size: 256
+  model_input_size: 256
+  patches_per_image: 100
+  validation_stride: 128
+
+  vessel_center_probability: 0.60
+  hard_negative_probability: 0.25
+  random_probability: 0.15
+
+  minimum_vessel_fraction: 0.01
+  hard_negative_max_vessel_fraction: 0.005
+  hard_negative_candidates: 20
+  max_sampling_attempts: 20
+
+  include_empty_validation_patches: true
+
+  # Reduced-strength revision (v2) of the DRIVE-to-target vessel-scale gap
+  # augmentation used in config_baseline_matched_topology_scaleaug_seed42.yaml.
+  # A5/A6 with the wider range (prob 0.8, [0.75, 2.0]) measurably reduced
+  # in-domain DRIVE Dice relative to A3 (no scale augmentation: 0.8228 TTA)
+  # while buying cross-dataset generalization on CHASE_DB1/HRF. This narrower,
+  # less frequent range keeps most training patches closer to DRIVE's native
+  # scale, testing whether DRIVE Dice recovers while still retaining part of
+  # the cross-dataset benefit. Matched with
+  # config_topology_ablation_a7_scaleaug_reduced.yaml.
+  scale_augmentation:
+    enabled: true
+    probability: 0.5
+    min_scale: 0.85
+    max_scale: 1.4
+
+preprocessing:
+  image_size:
+    height: 256
+    width: 256
+  channels: 3
+  clahe:
+    enabled: true
+
+augmentation:
+  enabled: true
+  note: "Uses the synchronized training transform implemented by src.datasets.get_train_transform."
+
+dataloader:
+  batch_size: 2
+  num_workers: 0
+  pin_memory: true
+  shuffle: true
+  drop_last: false
+  persistent_workers: false
+
+model:
+  name: "MVTransUNet"
+  input_channels: 3
+  output_channels: 1
+
+  backbone:
+    encoder: "resnet50"
+    pretrained: true
+
+  transformer:
+    embed_dim: 768
+
+  vessel_attention:
+    reduction_ratio: 16
+
+  decoder:
+    dropout_rate: 0.10
+
+  deep_supervision:
+    enabled: true
+
+baseline_loss:
+  name: "MatchedBaselineLoss"
+  segmentation_bce_weight: 0.50
+  segmentation_dice_weight: 0.50
+  auxiliary_weight: 0.20
+  auxiliary_stage_weights: [0.25, 0.50, 0.75]
+
+optimizer:
+  name: "AdamW"
+  learning_rate: 0.00005
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  epsilon: 0.00000001
+
+scheduler:
+  name: "ReduceLROnPlateau"
+  mode: "max"
+  factor: 0.5
+  patience: 8
+  threshold: 0.0001
+  min_lr: 0.000001
+
+training:
+  epochs: 200
+  gradient_accumulation_steps: 2
+
+  gradient_clipping:
+    enabled: true
+    max_norm: 1.0
+
+  early_stopping:
+    enabled: true
+    patience: 35
+
+checkpoint:
+  directory: "checkpoints/baseline_matched_scaleaug_v2_seed42"
+  resume: false
+  resume_from_best: false
+  save_last: true
+  save_best: true
+  best_model_name: "best_model.pth"
+  last_model_name: "last_model.pth"
+
+logging:
+  directory: "logs/baseline_matched_scaleaug_v2_seed42"
+  tensorboard:
+    enabled: true
+
+validation:
+  threshold: 0.5

@@ -609,6 +609,64 @@ def crop_topology_patch(
     return cropped
 
 
+def random_scale_topology_arrays(
+    arrays: Dict[str, np.ndarray],
+    minimum_scale: float,
+    maximum_scale: float,
+) -> Tuple[Dict[str, np.ndarray], float]:
+    """Randomly rescale the image and all four aligned topology targets.
+
+    Mirrors ``random_scale_image_and_mask`` in ``src.datasets`` exactly: the
+    image is resized with bilinear interpolation, and every binary target
+    (mask, skeleton, endpoint, junction) is resized with nearest-neighbour
+    interpolation and re-binarized afterward. Applying the identical scaling
+    semantics in both trainers keeps the topology and matched-baseline
+    scale-augmentation experiments comparable under the strict matched
+    protocol.
+    """
+
+    minimum_scale = float(minimum_scale)
+    maximum_scale = float(maximum_scale)
+
+    if minimum_scale <= 0.0 or maximum_scale <= 0.0:
+        raise ValueError("Scale limits must be greater than zero.")
+    if minimum_scale > maximum_scale:
+        raise ValueError(
+            "minimum_scale cannot be greater than maximum_scale."
+        )
+
+    source_height, source_width = arrays["mask"].shape[:2]
+
+    scale_factor = float(
+        np.random.uniform(minimum_scale, maximum_scale)
+    )
+
+    scaled_height = max(1, int(round(source_height * scale_factor)))
+    scaled_width = max(1, int(round(source_width * scale_factor)))
+
+    scaled: Dict[str, np.ndarray] = {
+        "image": np.ascontiguousarray(
+            cv2.resize(
+                arrays["image"],
+                dsize=(scaled_width, scaled_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        )
+    }
+
+    for target_name in ("mask", "skeleton", "endpoint", "junction"):
+        resized = cv2.resize(
+            arrays[target_name].astype(np.float32),
+            dsize=(scaled_width, scaled_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        scaled[target_name] = np.ascontiguousarray(
+            (resized > 0.5).astype(np.float32)
+        )
+
+    return scaled, scale_factor
+
+
 def center_to_top_left(
     center_y: int,
     center_x: int,
@@ -760,8 +818,30 @@ class RandomPatchTopologyDataset(Dataset):
         clahe: bool = True,
         clahe_clip_limit: float = 2.0,
         clahe_tile_grid_size: int = 8,
+        scale_augmentation_enabled: bool = False,
+        scale_augmentation_probability: float = 0.80,
+        scale_augmentation_min: float = 0.65,
+        scale_augmentation_max: float = 1.50,
     ) -> None:
         super().__init__()
+
+        if not 0.0 <= float(scale_augmentation_probability) <= 1.0:
+            raise ValueError(
+                "scale_augmentation_probability must be between 0 and 1."
+            )
+        if float(scale_augmentation_min) <= 0.0:
+            raise ValueError("scale_augmentation_min must be greater than zero.")
+        if float(scale_augmentation_max) <= 0.0:
+            raise ValueError("scale_augmentation_max must be greater than zero.")
+        if float(scale_augmentation_min) > float(scale_augmentation_max):
+            raise ValueError(
+                "scale_augmentation_min cannot exceed scale_augmentation_max."
+            )
+
+        self.scale_augmentation_enabled = bool(scale_augmentation_enabled)
+        self.scale_augmentation_probability = float(scale_augmentation_probability)
+        self.scale_augmentation_min = float(scale_augmentation_min)
+        self.scale_augmentation_max = float(scale_augmentation_max)
 
         self.samples = list(samples)
 
@@ -1264,6 +1344,19 @@ class RandomPatchTopologyDataset(Dataset):
             sample
         )
 
+        scale_applied = False
+        scale_factor = 1.0
+        if (
+            self.scale_augmentation_enabled
+            and float(np.random.random()) < self.scale_augmentation_probability
+        ):
+            arrays, scale_factor = random_scale_topology_arrays(
+                arrays=arrays,
+                minimum_scale=self.scale_augmentation_min,
+                maximum_scale=self.scale_augmentation_max,
+            )
+            scale_applied = True
+
         arrays = pad_topology_arrays(
             arrays=arrays,
             minimum_height=self.patch_height,
@@ -1313,6 +1406,8 @@ class RandomPatchTopologyDataset(Dataset):
                 sample_type
                 == "hard_negative"
             ),
+            "scale_augmentation_applied": scale_applied,
+            "scale_factor": float(scale_factor),
         }
 
 
@@ -1737,6 +1832,10 @@ def build_topology_patch_dataloaders(
     persistent_workers: bool = False,
     drop_last: bool = False,
     include_empty_validation_patches: bool = True,
+    scale_augmentation_enabled: bool = False,
+    scale_augmentation_probability: float = 0.80,
+    scale_augmentation_min: float = 0.65,
+    scale_augmentation_max: float = 1.50,
 ) -> Tuple[DataLoader, DataLoader]:
     """Build topology-aware random-train/grid-validation loaders."""
 
@@ -1783,6 +1882,10 @@ def build_topology_patch_dataloaders(
             model_input_size
         ),
         clahe=clahe,
+        scale_augmentation_enabled=scale_augmentation_enabled,
+        scale_augmentation_probability=scale_augmentation_probability,
+        scale_augmentation_min=scale_augmentation_min,
+        scale_augmentation_max=scale_augmentation_max,
     )
 
     validation_dataset = GridPatchTopologyDataset(

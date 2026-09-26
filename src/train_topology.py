@@ -102,6 +102,10 @@ def build_training_loaders(config: Mapping) -> Tuple[torch.utils.data.DataLoader
             hard_negative_candidates=int(patch.get("hard_negative_candidates", 20)),
             max_sampling_attempts=int(patch.get("max_sampling_attempts", 20)),
             include_empty_validation_patches=bool(patch.get("include_empty_validation_patches", True)),
+            scale_augmentation_enabled=bool(patch.get("scale_augmentation", {}).get("enabled", False)),
+            scale_augmentation_probability=float(patch.get("scale_augmentation", {}).get("probability", 0.0)),
+            scale_augmentation_min=float(patch.get("scale_augmentation", {}).get("min_scale", 1.0)),
+            scale_augmentation_max=float(patch.get("scale_augmentation", {}).get("max_scale", 1.0)),
         )
         return train_loader, val_loader, f"topology patch training ({patch_size} -> {input_size})"
 
@@ -126,6 +130,9 @@ def build_model(config: Mapping) -> MVTransUNetTopology:
         topology_refinement_blocks=int(topology.get("refinement_blocks", 2)),
         topology_fusion_dropout=float(topology.get("fusion_dropout", 0.1)),
         topology_head_dropout=float(topology.get("head_dropout", 0.0)),
+        vessel_attention_scale_conditioning=bool(
+            model.get("vessel_attention", {}).get("scale_conditioning", False)
+        ),
     )
 
 
@@ -150,6 +157,12 @@ def build_criterion(config: Mapping) -> MVTransUNetTopologyLoss:
         node_focal_gamma=float(loss.get("node_focal_gamma", 2.0)),
         cldice_iterations=int(loss.get("cldice_iterations", 10)),
         auxiliary_stage_weights=tuple(float(x) for x in loss.get("auxiliary_stage_weights", [0.25, 0.50, 0.75])),
+        use_width_adaptive_weighting=bool(loss.get("use_width_adaptive_weighting", False)),
+        width_adaptive_apply_to_segmentation=bool(loss.get("width_adaptive_apply_to_segmentation", True)),
+        width_adaptive_apply_to_skeleton=bool(loss.get("width_adaptive_apply_to_skeleton", True)),
+        width_adaptive_reference_width=float(loss.get("width_adaptive_reference_width", 3.0)),
+        width_adaptive_maximum_weight=float(loss.get("width_adaptive_maximum_weight", 5.0)),
+        width_adaptive_epsilon=float(loss.get("width_adaptive_epsilon", 1e-3)),
     )
 
 
@@ -215,8 +228,21 @@ def run_epoch(
                     optimizer.zero_grad(set_to_none=True)
                 continue
 
+            # RandomPatchTopologyDataset (training) includes a per-patch
+            # ground-truth "scale_factor" -- the exact scale-augmentation
+            # ratio applied to that patch, or 1.0 if augmentation was not
+            # applied/enabled. GridPatchTopologyDataset (validation) has no
+            # augmentation, so it has no "scale_factor" key; default to 1.0
+            # (no scale change), matching its actual, unaugmented content.
+            # Ignored by the model entirely unless the config enabled
+            # model.vessel_attention.scale_conditioning.
+            if "scale_factor" in batch:
+                scale_ratio = batch["scale_factor"].to(device, non_blocking=True).float()
+            else:
+                scale_ratio = torch.ones(images.shape[0], device=device, dtype=images.dtype)
+
             with autocast(device_type=device.type, enabled=amp_enabled):
-                outputs = model(images, return_topology=True)
+                outputs = model(images, scale_ratio=scale_ratio, return_topology=True)
                 loss_values = loss_to_dict(criterion(outputs, targets))
                 total_loss = loss_values["total_loss"]
 

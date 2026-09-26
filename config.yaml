@@ -1,45 +1,60 @@
 project:
-  name: "MV-TransUNet++"
-  version: "Topology_A2_BranchOnly"
-  task: "retinal_vessel_segmentation"
-
+  name: MV-TransUNet
+  version: Baseline_Patch256_Control_RTX3060_6GB
+  task: retinal_vessel_segmentation
 seed:
   value: 42
   deterministic: true
-
 hardware:
-  device: "cuda"
+  device: cuda
+  accelerator: local_windows
+  gpu_type: NVIDIA_RTX_3060_Laptop_6GB
   mixed_precision: true
   cudnn_benchmark: false
-
 dataset:
-  name: "DRIVE"
+  name: DRIVE
   train_dataset:
-    name: "DRIVE_train"
-    image_dir: "datasets/DRIVE/training/image"
-    mask_dir: "datasets/DRIVE/training/1st_manual"
-  validation_ratio: 0.20
+    name: DRIVE_train
+    image_dir: datasets_processed/DRIVE_train/images
+    mask_dir: datasets_processed/DRIVE_train/masks
+  test_dataset:
+    name: DRIVE_test
+    image_dir: datasets_processed/DRIVE_test/images
+    mask_dir: datasets_processed/DRIVE_test/masks
+  external_datasets:
+    DRIVE_CONTROL:
+      image_dir: datasets/DRIVE/test/images
+      mask_dir: datasets/DRIVE/test/1st_manual
+    STARE:
+      image_dir: datasets_processed/STARE/images
+      mask_dir: datasets_processed/STARE/masks
+    CHASE_DB1:
+      image_dir: datasets_processed/CHASE_DB1/images
+      mask_dir: datasets_processed/CHASE_DB1/masks
+    HRF:
+      image_dir: datasets_processed/HRF/images
+      mask_dir: datasets_processed/HRF/masks
+  validation_ratio: 0.2
   split_seed: 42
-
-topology:
-  enabled: true
-  target_root: "datasets_topology/DRIVE_train"
-
 patch_training:
   enabled: true
   patch_size: 256
   model_input_size: 256
-  patches_per_image: 100
-  validation_stride: 128
-  vessel_center_probability: 0.60
-  hard_negative_probability: 0.25
-  random_probability: 0.15
+  patches_per_image: 300
+  validation_stride: 64
+  vessel_center_probability: 0.6
+  hard_negative_probability: 0.3
+  random_probability: 0.1
   minimum_vessel_fraction: 0.01
   hard_negative_max_vessel_fraction: 0.005
-  hard_negative_candidates: 20
-  max_sampling_attempts: 20
+  hard_negative_candidates: 30
+  max_sampling_attempts: 30
   include_empty_validation_patches: true
-
+  scale_augmentation:
+    enabled: true
+    probability: 0.7
+    min_scale: 0.8
+    max_scale: 1.2
 preprocessing:
   image_size:
     height: 256
@@ -47,100 +62,256 @@ preprocessing:
   channels: 3
   clahe:
     enabled: true
-
+    clip_limit: 2.0
+    tile_grid_size: 8
+  normalization:
+    enabled: true
+    mean:
+    - 0.485
+    - 0.456
+    - 0.406
+    std:
+    - 0.229
+    - 0.224
+    - 0.225
+topology_targets:
+  enabled: true
+  mask_threshold: 0.5
+  cleanup:
+    remove_small_objects: true
+    minimum_object_size: 8
+    fill_small_holes: true
+    maximum_hole_size: 8
+  skeleton:
+    spur_pruning_enabled: true
+    spur_length_threshold: 5
+    max_iterations: 20
+  nodes:
+    border_margin: 5
+    endpoint_radius: 2
+    junction_radius: 3
+    cluster_junctions: true
+  thin_vessels:
+    enabled: true
+    radius_threshold: 2.0
+  cache:
+    enabled: true
+    directory: datasets_topology
+    overwrite: false
 augmentation:
   enabled: true
-  note: "Topology datasets apply synchronized geometric augmentation internally."
-
+  horizontal_flip:
+    enabled: true
+    probability: 0.5
+  vertical_flip:
+    enabled: true
+    probability: 0.5
+  rotation:
+    enabled: true
+    limit: 30
+    probability: 0.5
+  elastic_transform:
+    enabled: true
+    alpha: 120
+    sigma: 6
+    probability: 0.3
+  brightness_contrast:
+    enabled: true
+    probability: 0.5
 dataloader:
-  batch_size: 2
+  batch_size: 1
   num_workers: 0
   pin_memory: true
   shuffle: true
-  drop_last: false
+  drop_last: true
   persistent_workers: false
-
 model:
-  name: "MVTransUNetTopology"
+  name: MV-TransUNet
   input_channels: 3
   output_channels: 1
   backbone:
-    encoder: "resnet50"
+    encoder: resnet50
     pretrained: true
   transformer:
+    name: ViT-B_16
+    image_size: 256
+    patch_size: 16
     embed_dim: 768
+    depth: 12
+    heads: 12
+    mlp_dim: 3072
+    dropout: 0.1
   vessel_attention:
+    enabled: true
     reduction_ratio: 16
   decoder:
-    dropout_rate: 0.10
+    type: multi_scale_progressive
+    boundary_attention: true
+    use_skip_connections: true
+    dropout_rate: 0.1
+    channels:
+    - 512
+    - 256
+    - 128
+    - 64
   deep_supervision:
     enabled: true
-  topology_branch:
-    topology_channels: 128
-    branch_channels: 32
-    head_hidden_channels: 64
-    refinement_blocks: 2
-    fusion_dropout: 0.10
-    head_dropout: 0.0
-
-topology_loss:
-  name: "MVTransUNetTopologyLoss"
-  segmentation_weight: 1.00
-  cldice_weight: 0.00
-  skeleton_weight: 0.00
-  endpoint_weight: 0.00
-  junction_weight: 0.00
-  auxiliary_weight: 0.20
-  baseline_weight: 0.10
-  segmentation_bce_weight: 0.50
-  segmentation_dice_weight: 0.50
-  skeleton_bce_weight: 0.50
-  skeleton_dice_weight: 0.50
-  node_bce_weight: 0.50
-  node_focal_weight: 0.50
-  node_maximum_positive_weight: 50.0
-  node_focal_alpha: 0.75
-  node_focal_gamma: 2.0
-  cldice_iterations: 10
-  auxiliary_stage_weights: [0.25, 0.50, 0.75]
-
+loss:
+  name: MVTransUNetLoss
+  focal_tversky_weight: 0.6
+  boundary_weight: 0.25
+  cldice_weight: 0.15
+  auxiliary_weights:
+  - 0.1
+  - 0.2
+  - 0.3
 optimizer:
-  name: "AdamW"
-  learning_rate: 0.00005
+  name: AdamW
+  learning_rate: 5.0e-05
   weight_decay: 0.0001
-  betas: [0.9, 0.999]
-  epsilon: 0.00000001
-
+  betas:
+  - 0.9
+  - 0.999
+  epsilon: 1.0e-08
 scheduler:
-  name: "ReduceLROnPlateau"
+  name: ReduceLROnPlateau
   factor: 0.5
   patience: 8
   threshold: 0.0001
-  min_lr: 0.000001
-
+  min_lr: 1.0e-06
 training:
-  epochs: 200
-  gradient_accumulation_steps: 2
+  epochs: 250
+  gradient_accumulation_steps: 8
   gradient_clipping:
     enabled: true
     max_norm: 1.0
   early_stopping:
     enabled: true
     patience: 35
-
 checkpoint:
-  directory: "checkpoints/topology_branch_only_seed42"
+  directory: checkpoints/baseline_patch256_control_rtx3060_seed42
   resume: false
   resume_from_best: false
   save_last: true
   save_best: true
-  best_model_name: "best_model.pth"
-  last_model_name: "last_model.pth"
-
+  best_model_name: best_model.pth
+  last_model_name: last_model.pth
 logging:
-  directory: "logs/topology_branch_only_seed42"
+  directory: logs/baseline_patch256_control_rtx3060_seed42
   tensorboard:
     enabled: true
-
 validation:
   threshold: 0.5
+evaluation:
+  threshold: 0.5
+  batch_size: 1
+  reconstruction:
+    fusion_mode: hann
+    minimum_weight: 0.05
+    stride: 64
+    use_tta: false
+    batch_size: 1
+  metrics:
+  - dice
+  - sensitivity
+  - specificity
+  - accuracy
+  - auc
+  - thin_vessel_dice
+  test_dataset:
+    image_dir: datasets_processed/DRIVE_test/images
+    mask_dir: datasets_processed/DRIVE_test/masks
+  resolution_normalization:
+    enabled: true
+    frozen_threshold: 0.89
+    datasets:
+    - DRIVE_CONTROL
+    target_short_sides:
+    - 565
+    - 584
+    - 768
+    - 1024
+    save_predictions: false
+  adaptive_resolution_normalization:
+    enabled: true
+    frozen_threshold: 0.89
+    source:
+      name: DRIVE
+      image_dir: datasets/DRIVE/training/image
+    datasets:
+    - DRIVE_CONTROL
+    - STARE
+    - CHASE_DB1
+    - HRF
+    fov_estimation:
+      grayscale_threshold: 10
+      closing_kernel_size: 15
+      minimum_component_fraction: 0.2
+    resizing:
+      minimum_scale_factor: 0.2
+      maximum_scale_factor: 2.0
+      minimum_short_side: 384
+      maximum_short_side: 1024
+    save_predictions: false
+    mask_validation:
+      enabled: true
+      strict: true
+      min_foreground_fraction: 0.001
+      max_foreground_fraction: 0.35
+      max_suspicious_mask_fraction: 0.25
+  vessel_scale_adaptive_inference:
+    enabled: true
+    source:
+      image_dir: datasets/DRIVE/training/image
+      reference_statistic: median
+    preprocessing:
+      channel: green
+      invert: true
+      use_clahe: true
+      clahe_clip_limit: 2.0
+      clahe_grid_size: 8
+      fov_border_exclusion_fraction: 0.03
+    vesselness:
+      sigmas:
+      - 0.75
+      - 1.0
+      - 1.25
+      - 1.5
+      - 2.0
+      - 2.5
+      - 3.0
+      - 4.0
+      - 5.0
+      response_quantile: 0.9
+      minimum_valid_pixels: 500
+      minimum_component_area: 8
+    scale_mapping:
+      exponent_gamma: 1.0
+      minimum_scale_factor: 0.45
+      maximum_scale_factor: 1.8
+      source_dead_band: 0.05
+    confidence:
+      enabled: true
+      minimum_confidence: 0.2
+      shrinkage_enabled: true
+      minimum_target_weight: 0.35
+      maximum_target_weight: 1.0
+    fallback:
+      use_fov_based_d2_ar: true
+      use_native_if_fov_fails: true
+    cache:
+      enabled: true
+      directory: cache/vessel_scale_adaptive
+    output:
+      results_filename: vessel_scale_adaptive_results.yaml
+      save_per_image_results: true
+      save_scale_diagnostics: true
+experiment:
+  name: baseline_patch256_control_seed42
+  output_directory: experiments/d2_s_stable_fp32_seed42
+  description: Controlled D2-S experiment testing source-only vessel-scale augmentation
+    during DRIVE training. Scale augmentation is applied only to training images before
+    patch sampling. Validation and all test datasets remain unmodified. The scale
+    range is restricted to 0.80–1.20, the learning rate is reduced to 5e-5, mixed
+    precision is disabled, and gradient clipping is retained to address the numerical
+    instability observed in the previous run.

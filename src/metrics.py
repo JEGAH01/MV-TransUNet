@@ -241,46 +241,21 @@ def specificity(prediction,target):
 # ============================================================
 
 
-def accuracy(prediction,target):
-
-
-    TP,TN,FP,FN = confusion_matrix(
-
+def accuracy(
+    prediction,
+    target,
+):
+    TP, TN, FP, FN = confusion_matrix(
         prediction,
-
-        target
-
+        target,
     )
 
+    total = TP + TN + FP + FN
 
-    return (
-
-        TP+TN
-
+    return float(
+        (TP + TN)
         /
-
-        (
-
-            TP
-
-            +
-
-            TN
-
-            +
-
-            FP
-
-            +
-
-            FN
-
-            +
-
-            1e-8
-
-        )
-
+        (total + 1e-8)
     )
 
 

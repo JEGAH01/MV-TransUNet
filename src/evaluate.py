@@ -1,161 +1,216 @@
 """
-MV-TransUNet Evaluation Pipeline
+Clean, publication-oriented MV-TransUNet evaluation pipeline.
 
-Retinal Vessel Segmentation Framework
+Protocol
+--------
+1. Reconstruct the exact DRIVE internal validation split used during training.
+2. Run native-resolution sliding-window inference with overlapping patches.
+3. Fuse overlapping probability maps with a Hann window.
+4. Select one binarization threshold on reconstructed validation images only.
+5. Freeze that threshold.
+6. Evaluate the official DRIVE test set and all external datasets with exactly
+   the same reconstruction, fusion, preprocessing, and metric implementation.
 
-Metrics:
-    - Dice
-    - Sensitivity
-    - Specificity
-    - Accuracy
-    - ROC-AUC
-
-Additional:
-    - Thin vessel Dice
-    - Skeletonization analysis
-    - Cross dataset evaluation
-
-Supported:
-    - DRIVE (train/test kept strictly separate -- see prepare_datasets.py)
-    - STARE
-    - CHASE_DB1
-    - HRF
-
-This script reports THREE distinct numbers, and they are not
-interchangeable:
-
-1. "DRIVE_internal_validation" -- the same image-level validation
-   split used during training (dataset.validation_ratio /
-   dataset.split_seed, drawn from dataset.train_dataset). This is a
-   cross-check against the "Validation Dice" your training log
-   reported; it is NOT a fair literature comparison, because it was
-   used for early-stopping checkpoint selection.
-
-2. "DRIVE_test" -- dataset.test_dataset, evaluated only here, never
-   touched during training. THIS is the number comparable to published
-   DRIVE baselines. Requires prepare_datasets.py to have been re-run
-   with DRIVE_train/DRIVE_test kept separate, and config.yaml's
-   dataset.test_dataset to point at the real held-out folder.
-
-3. Cross-dataset results (STARE / CHASE_DB1 / HRF) -- generalization
-   check, trained on DRIVE only, never seen these datasets at all.
+Important
+---------
+- The checkpoint's saved ``best_dice`` is the patch-validation score used for
+  checkpoint selection. It is not directly comparable to reconstructed
+  whole-image Dice.
+- Test-set thresholds are never tuned.
+- Test-time augmentation is intentionally disabled in this standardized
+  protocol.
+- Metrics come from ``src.metrics.calculate_metrics`` as the single source of
+  truth.
 """
 
+from __future__ import annotations
 
-import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
-
+from torch.amp import autocast
 from tqdm import tqdm
 
-from sklearn.metrics import roc_auc_score
-
-from skimage.morphology import skeletonize
-
-from torch.amp import autocast
-
 from models.mv_transunet import MVTransUNet
-
 from src.datasets import (
-    build_cross_dataset_loaders,
-    build_test_loader,
+    GridPatchRetinalDataset,
+    create_dataloader,
     create_split_indices,
     get_validation_transform,
+    load_binary_mask,
     load_sample_pairs,
-    GridPatchRetinalDataset,
-    RetinalVesselDataset,
 )
-from src.datasets import create_dataloader
+from src.metrics import calculate_metrics
+
+
+SamplePair = Tuple[Path, Path]
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION AND REPRODUCIBILITY
 # ============================================================
 
-def load_config(path):
-    with open(path, "r") as file:
-        return yaml.safe_load(file)
+
+def load_config(path: str | Path = "config.yaml") -> Dict[str, Any]:
+    """Load and validate the YAML configuration."""
+
+    config_path = Path(path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Configuration file not found: {config_path.resolve()}"
+        )
+
+    with config_path.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+
+    if not isinstance(config, dict):
+        raise ValueError("config.yaml is empty or does not contain a mapping.")
+
+    return config
+
+
+def seed_everything(seed: int, deterministic: bool = True) -> None:
+    """Seed NumPy and PyTorch for reproducible evaluation."""
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = not bool(deterministic)
+
+
+def resolve_device(config: Mapping[str, Any]) -> torch.device:
+    """Resolve CPU/CUDA from config and print the selected runtime."""
+
+    hardware = config.get("hardware", {})
+    requested = str(hardware.get("device", "auto")).strip().lower()
+    gpu_id = int(hardware.get("gpu_id", 0))
+
+    if requested not in {"auto", "cuda", "cpu"}:
+        raise ValueError(
+            "hardware.device must be one of: auto, cuda, cpu. "
+            f"Received: {requested!r}"
+        )
+
+    if requested == "cpu":
+        return torch.device("cpu")
+
+    if torch.cuda.is_available():
+        if not 0 <= gpu_id < torch.cuda.device_count():
+            raise ValueError(
+                f"hardware.gpu_id={gpu_id} is invalid; "
+                f"{torch.cuda.device_count()} CUDA device(s) detected."
+            )
+
+        torch.cuda.set_device(gpu_id)
+        device = torch.device(f"cuda:{gpu_id}")
+
+        print("CUDA available: True")
+        print("PyTorch version:", torch.__version__)
+        print("PyTorch CUDA runtime:", torch.version.cuda)
+        print("Selected GPU:", torch.cuda.get_device_name(gpu_id))
+
+        return device
+
+    if requested == "cuda":
+        print(
+            "WARNING: CUDA was requested, but torch.cuda.is_available() is False. "
+            "Evaluation will continue on CPU."
+        )
+
+    return torch.device("cpu")
 
 
 # ============================================================
-# METRICS
+# MODEL AND CHECKPOINT
 # ============================================================
 
-def calculate_metrics(prediction, target):
-    prediction = prediction.astype(bool)
-    target = target.astype(bool)
 
-    TP = np.logical_and(prediction, target).sum()
-    TN = np.logical_and(np.logical_not(prediction), np.logical_not(target)).sum()
-    FP = np.logical_and(prediction, np.logical_not(target)).sum()
-    FN = np.logical_and(np.logical_not(prediction), target).sum()
+def get_main_output(outputs: Any) -> torch.Tensor:
+    """Extract final logits from tensor or deep-supervision dictionary output."""
 
-    dice = (2 * TP) / (2 * TP + FP + FN + 1e-8)
-    sensitivity = TP / (TP + FN + 1e-8)
-    specificity = TN / (TN + FP + 1e-8)
-    accuracy = (TP + TN) / (TP + TN + FP + FN + 1e-8)
+    if torch.is_tensor(outputs):
+        return outputs
 
-    return {
-        "dice": dice,
-        "sensitivity": sensitivity,
-        "specificity": specificity,
-        "accuracy": accuracy,
-    }
+    if isinstance(outputs, dict):
+        for key in ("main_output", "out", "logits"):
+            if key in outputs:
+                return outputs[key]
 
+        raise KeyError(
+            "Model returned a dictionary without main_output, out, or logits."
+        )
 
-# ============================================================
-# THIN VESSEL ANALYSIS
-# ============================================================
+    if isinstance(outputs, (tuple, list)) and outputs:
+        if torch.is_tensor(outputs[0]):
+            return outputs[0]
 
-def extract_thin_vessels(mask, threshold=3):
-    mask = mask.astype(np.uint8)
-
-    skeleton = skeletonize(mask)
-
-    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-
-    vessel_width = distance * 2
-
-    thin_region = vessel_width <= threshold
-
-    thin_vessels = np.logical_and(skeleton, thin_region)
-
-    return thin_vessels
+    raise TypeError(
+        "Unsupported model output type. Expected tensor, dictionary, tuple, or list."
+    )
 
 
-def calculate_thin_vessel_dice(prediction, target):
-    target_thin = extract_thin_vessels(target)
-    prediction_thin = np.logical_and(prediction, target_thin)
-    metric = calculate_metrics(prediction_thin, target_thin)
-    return metric["dice"]
-
-
-# ============================================================
-# MODEL LOADING
-# ============================================================
-
-def load_model(checkpoint_path, device, config):
+def resolve_checkpoint_path(config: Mapping[str, Any]) -> Path:
     """
-    Build MVTransUNet with the EXACT same architecture arguments
-    train.py used, read from config.yaml -- not hardcoded defaults.
+    Support both checkpoint styles used across the project:
 
-    A mismatch here (e.g. a different vessel_reduction_ratio or
-    deep_supervision flag than what was actually trained) will raise
-    a loud state_dict shape-mismatch error rather than silently doing
-    the wrong thing, but there is no reason to rely on that safety
-    net when the config is right there.
+    1. checkpoint.directory: checkpoints/experiment_D
+    2. checkpoint.root_directory + experiment.name
     """
+
+    checkpoint = config.get("checkpoint", {})
+    best_name = str(checkpoint.get("best_model_name", "best_model.pth"))
+
+    explicit_directory = checkpoint.get("directory")
+    if explicit_directory:
+        return Path(str(explicit_directory)) / best_name
+
+    root = Path(str(checkpoint.get("root_directory", "checkpoints")))
+    experiment_name = str(
+        config.get("experiment", {}).get("name", "default_experiment")
+    ).strip()
+
+    return root / experiment_name / best_name
+
+
+def resolve_output_directory(config: Mapping[str, Any]) -> Path:
+    """Resolve experiment output directory while supporting old/new config styles."""
+
+    experiment = config.get("experiment", {})
+
+    explicit = experiment.get("output_directory")
+    if explicit:
+        return Path(str(explicit))
+
+    root = Path(str(experiment.get("output_root_directory", "experiments")))
+    name = str(experiment.get("name", "default_experiment")).strip()
+
+    return root / name
+
+
+def load_model(
+    checkpoint_path: str | Path,
+    device: torch.device,
+    config: Mapping[str, Any],
+) -> Tuple[torch.nn.Module, Dict[str, Any]]:
+    """Build the exact configured architecture and load its checkpoint."""
 
     model_config = config.get("model", {})
-    backbone_config = model_config.get("backbone", {})
-    deep_supervision_config = model_config.get("deep_supervision", {})
+    deep_supervision = model_config.get("deep_supervision", {})
 
     model = MVTransUNet(
-        pretrained=False,  # irrelevant at eval time -- weights are overwritten below
+        pretrained=False,
         transformer_channels=int(
             model_config.get("transformer", {}).get("embed_dim", 768)
         ),
@@ -163,12 +218,7 @@ def load_model(checkpoint_path, device, config):
             model_config.get("vessel_attention", {}).get("reduction_ratio", 16)
         ),
         output_channels=int(model_config.get("output_channels", 1)),
-        deep_supervision=bool(deep_supervision_config.get("enabled", True)),
-        # nn.Dropout2d has no learnable parameters, so this value has
-        # zero effect on state_dict loading either way -- matched to
-        # train.py purely for architecture-metadata consistency, and
-        # because model.eval() (called below) disables Dropout2d
-        # regardless of this value.
+        deep_supervision=bool(deep_supervision.get("enabled", True)),
         decoder_dropout_rate=float(
             model_config.get("decoder", {}).get("dropout_rate", 0.1)
         ),
@@ -178,838 +228,881 @@ def load_model(checkpoint_path, device, config):
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path.resolve()}\n"
-            "Check config.yaml's checkpoint.directory / "
-            "checkpoint.best_model_name match where train.py actually "
-            "saved it."
+            f"Checkpoint not found: {checkpoint_path.resolve()}"
         )
 
     checkpoint = torch.load(
         checkpoint_path,
         map_location=device,
-        # Matches train.py's load_checkpoint. Newer PyTorch defaults
-        # torch.load to weights_only=True, which fails on a full
-        # training-state checkpoint dict (optimizer/scheduler state,
-        # plain Python ints/floats) -- not just a bare state_dict.
         weights_only=False,
     )
 
-    model.load_state_dict(checkpoint["model_state"])
-
+    state_dict = checkpoint.get("model_state", checkpoint)
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
+    print("Loaded checkpoint:", checkpoint_path.resolve())
     print(
-        "Loaded checkpoint:",
-        checkpoint_path,
-    )
-    print(
-        "  epoch:", checkpoint.get("epoch", "unknown"),
-        "| best_dice recorded at save time:", checkpoint.get("best_dice", "unknown"),
+        "  saved epoch:",
+        checkpoint.get("epoch", "unknown"),
+        "| saved patch-validation best_dice:",
+        checkpoint.get("best_dice", "unknown"),
     )
 
-    return model
+    return model, checkpoint
 
 
 # ============================================================
-# INTERNAL VALIDATION SPLIT RECONSTRUCTION
+# DATASET RESOLUTION
 # ============================================================
 
-def _reconstruct_validation_pairs(config):
-    """
-    Reconstruct the EXACT image-level validation split train.py used
-    -- same source directory, same validation_ratio, same split_seed,
-    same create_split_indices function actually imported from your
-    real datasets.py (not a reimplementation). Both loader builders
-    below share this so they operate on identical validation images,
-    differing only in whole-image vs. grid-patch evaluation.
-    """
 
-    train_dataset_config = config["dataset"]["train_dataset"]
+def reconstruct_internal_validation_pairs(
+    config: Mapping[str, Any],
+) -> List[SamplePair]:
+    """Recreate the exact image-level validation split used by train.py."""
+
+    dataset_config = config["dataset"]
+    train_config = dataset_config["train_dataset"]
 
     pairs = load_sample_pairs(
-        train_dataset_config["image_dir"],
-        train_dataset_config["mask_dir"],
+        train_config["image_dir"],
+        train_config["mask_dir"],
     )
+
+    if not pairs:
+        raise RuntimeError("No DRIVE training image-mask pairs were found.")
+
+    split_seed = int(
+        dataset_config.get("split_seed", config["seed"]["value"])
+    )
+    validation_ratio = float(dataset_config.get("validation_ratio", 0.2))
 
     _, validation_indices = create_split_indices(
         dataset_size=len(pairs),
-        validation_ratio=float(config["dataset"].get("validation_ratio", 0.2)),
-        seed=int(config["dataset"].get("split_seed", config["seed"]["value"])),
+        validation_ratio=validation_ratio,
+        seed=split_seed,
     )
 
-    validation_pairs = [pairs[i] for i in validation_indices]
+    validation_pairs = [pairs[index] for index in validation_indices]
+
+    if not validation_pairs:
+        raise RuntimeError("The reconstructed validation split is empty.")
 
     print(
-        f"Reconstructed internal validation split: "
-        f"{len(validation_pairs)} image(s) "
-        f"(out of {len(pairs)} in dataset.train_dataset)."
+        "Reconstructed DRIVE internal validation split:",
+        f"{len(validation_pairs)} image(s) from {len(pairs)} training image(s).",
     )
 
     return validation_pairs
 
 
-def build_internal_validation_loader_whole_image(config, image_size, batch_size=1):
-    """
-    Whole-image evaluation of the reconstructed validation split.
+def normalize_external_dataset_entries(
+    external_datasets: Any,
+) -> List[Tuple[str, Mapping[str, Any]]]:
+    """Normalize dictionary/list external-dataset config formats."""
 
-    This is the literature-style metric (one Dice per whole image,
-    then averaged) -- NOT what your training log's "Validation Dice"
-    reports, since train.py validates on deterministic overlapping
-    grid patches (patch_training.validation_stride), not whole
-    images. Use build_internal_validation_loader_grid_patches for a
-    number directly comparable to the training log instead. Neither
-    of these is the headline result -- see DRIVE_test for that.
-    """
+    if not external_datasets:
+        return []
 
-    validation_pairs = _reconstruct_validation_pairs(config)
+    if isinstance(external_datasets, dict):
+        return [
+            (str(name), dataset_config)
+            for name, dataset_config in external_datasets.items()
+        ]
 
-    dataset = RetinalVesselDataset(
-        image_dir=config["dataset"]["train_dataset"]["image_dir"],
-        mask_dir=config["dataset"]["train_dataset"]["mask_dir"],
-        samples=validation_pairs,
-        transform=get_validation_transform(image_size=image_size),
-        clahe=bool(config["preprocessing"]["clahe"].get("enabled", True)),
+    if isinstance(external_datasets, Sequence):
+        entries: List[Tuple[str, Mapping[str, Any]]] = []
+
+        for dataset_config in external_datasets:
+            if not isinstance(dataset_config, Mapping):
+                raise TypeError(
+                    "Each external dataset entry must be a mapping."
+                )
+
+            name = str(dataset_config["name"])
+            entries.append((name, dataset_config))
+
+        return entries
+
+    raise TypeError(
+        "dataset.external_datasets must be a mapping or sequence of mappings."
     )
 
-    return create_dataloader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=int(config["dataloader"].get("num_workers", 2)),
-        pin_memory=bool(config["dataloader"].get("pin_memory", True)),
-        persistent_workers=False,
-        drop_last=False,
-        seed=int(config["dataset"].get("split_seed", config["seed"]["value"])),
+
+def load_configured_pairs(
+    dataset_name: str,
+    dataset_config: Mapping[str, Any],
+) -> List[SamplePair]:
+    """Load and validate image-mask pairs for one configured dataset."""
+
+    if "image_dir" not in dataset_config or "mask_dir" not in dataset_config:
+        raise KeyError(
+            f"{dataset_name} requires image_dir and mask_dir in config.yaml."
+        )
+
+    pairs = load_sample_pairs(
+        dataset_config["image_dir"],
+        dataset_config["mask_dir"],
     )
 
+    if not pairs:
+        raise RuntimeError(
+            f"No image-mask pairs were found for {dataset_name}."
+        )
 
-def build_internal_validation_loader_grid_patches(config, batch_size=1):
-    """
-    Grid-patch evaluation of the reconstructed validation split,
-    using the SAME GridPatchRetinalDataset class and the SAME
-    patch_training.patch_size / model_input_size / validation_stride
-    values train.py used. This is the number that should match your
-    training log's per-epoch "Validation Dice" (up to CLAHE/transform
-    determinism), because it is the same methodology, not an
-    approximation of it.
-    """
+    print(f"{dataset_name}: discovered {len(pairs)} image-mask pair(s).")
+    return pairs
+
+
+# ============================================================
+# RECONSTRUCTION CONFIGURATION
+# ============================================================
+
+
+@dataclass(frozen=True)
+class ReconstructionSettings:
+    patch_size: int
+    model_input_size: int
+    stride: int
+    batch_size: int
+    num_workers: int
+    pin_memory: bool
+    fusion_mode: str
+    minimum_weight: float
+    clahe: bool
+    seed: int
+
+
+def resolve_reconstruction_settings(
+    config: Mapping[str, Any],
+) -> ReconstructionSettings:
+    """Read and validate all reconstruction settings."""
 
     patch_config = config.get("patch_training", {})
 
     if not bool(patch_config.get("enabled", False)):
         raise ValueError(
-            "patch_training.enabled is false -- grid-patch validation "
-            "reconstruction only applies to patch-based training runs. "
-            "Use build_internal_validation_loader_whole_image instead."
+            "This standardized evaluator requires patch_training.enabled: true."
         )
 
-    validation_pairs = _reconstruct_validation_pairs(config)
-
-    model_input_size = int(
-        patch_config.get("model_input_size", 256)
-    )
-    patch_size = int(
-        patch_config.get("patch_size", model_input_size)
-    )
-    validation_stride = int(
-        patch_config.get("validation_stride", max(1, patch_size // 2))
-    )
-
-    dataset = GridPatchRetinalDataset(
-        samples=validation_pairs,
-        patch_size=patch_size,
-        model_input_size=model_input_size,
-        stride=validation_stride,
-        transform=get_validation_transform(image_size=model_input_size),
-        clahe=bool(config["preprocessing"]["clahe"].get("enabled", True)),
-        include_empty_patches=bool(
-            patch_config.get("include_empty_validation_patches", True)
-        ),
-        minimum_vessel_fraction=0.0,
-    )
-
-    return create_dataloader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=int(config["dataloader"].get("num_workers", 2)),
-        pin_memory=bool(config["dataloader"].get("pin_memory", True)),
-        persistent_workers=False,
-        drop_last=False,
-        seed=int(config["dataset"].get("split_seed", config["seed"]["value"])),
-    )
-
-
-# ============================================================
-# EVALUATION FUNCTION
-# ============================================================
-
-def predict_with_tta(model, images, device):
-    """
-    Flip-based test-time augmentation.
-
-    Averages sigmoid probabilities over the identity image and its
-    horizontal, vertical, and horizontal+vertical flips, each
-    un-flipped back to the original orientation before averaging.
-    Free at inference (no retraining, no architecture change) and
-    well precedented for exactly this kind of small remaining-gap
-    problem. Expect roughly +1-2 Dice points; treat as a cheap,
-    low-risk lever to try before anything requiring retraining.
-    """
-
-    flip_configs = [
-        (None,),
-        (2,),       # vertical flip  (height axis)
-        (3,),       # horizontal flip (width axis)
-        (2, 3),     # both
-    ]
-
-    accumulated_probability = None
-
-    with autocast(device_type=device.type, enabled=device.type == "cuda"):
-        for dims in flip_configs:
-            if dims == (None,):
-                flipped_input = images
-            else:
-                flipped_input = torch.flip(images, dims=dims)
-
-            output = model(flipped_input)
-
-            probability = torch.sigmoid(output)
-
-            if dims != (None,):
-                probability = torch.flip(probability, dims=dims)
-
-            probability = probability.float()
-
-            accumulated_probability = (
-                probability
-                if accumulated_probability is None
-                else accumulated_probability + probability
-            )
-
-    return accumulated_probability / len(flip_configs)
-
-
-def sweep_threshold(model, loader, device, thresholds=None, use_tta=False):
-    """
-    Sweep binarization thresholds on a validation loader and return
-    the Dice-maximizing threshold.
-
-    IMPORTANT: only ever call this on a validation split, never on
-    DRIVE_test. The returned threshold should then be applied as a
-    FIXED value when evaluating DRIVE_test -- tuning the threshold
-    directly on test data would invalidate the comparison to
-    published baselines just as surely as training on it would.
-    """
-
-    if thresholds is None:
-        thresholds = np.arange(0.30, 0.71, 0.05)
-
-    all_probabilities = []
-    all_targets = []
-
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Threshold sweep (forward pass)"):
-            images = batch["image"].to(device, non_blocking=True)
-            targets = batch["mask"].numpy()
-
-            if use_tta:
-                probability = predict_with_tta(model, images, device)
-            else:
-                with autocast(device_type=device.type, enabled=device.type == "cuda"):
-                    probability = torch.sigmoid(model(images))
-
-            all_probabilities.append(probability.cpu().numpy())
-            all_targets.append(targets)
-
-    all_probabilities = np.concatenate(all_probabilities, axis=0)
-    all_targets = np.concatenate(all_targets, axis=0)
-
-    best_threshold = 0.5
-    best_dice = -1.0
-
-    print("\nThreshold sweep (validation split only):")
-
-    for threshold in thresholds:
-        dice_values = []
-
-        for probability, target in zip(all_probabilities, all_targets):
-            prediction = (probability.squeeze() > threshold)
-            dice_values.append(
-                calculate_metrics(prediction, target.squeeze())["dice"]
-            )
-
-        mean_dice = float(np.mean(dice_values))
-
-        print(f"  threshold={threshold:.2f} -> Dice={mean_dice:.4f}")
-
-        if mean_dice > best_dice:
-            best_dice = mean_dice
-            best_threshold = float(threshold)
-
-    print(f"Selected threshold: {best_threshold:.2f} (validation Dice={best_dice:.4f})")
-
-    return best_threshold
-
-
-def evaluate_dataset(model, loader, device, threshold=0.5, save_directory=None, use_tta=False):
-    results = []
-    all_probabilities = []
-    all_targets = []
-
-    if save_directory:
-        os.makedirs(save_directory, exist_ok=True)
-
-    with torch.no_grad():
-        for index, batch in enumerate(tqdm(loader, desc="Evaluating")):
-            images = batch["image"].to(device, non_blocking=True)
-            masks = batch["mask"].numpy()
-
-            with autocast(
-                device_type=device.type,
-                enabled=device.type == "cuda",
-            ):
-                if use_tta:
-                    probabilities = predict_with_tta(model, images, device)
-                else:
-                    outputs = model(images)
-                    probabilities = torch.sigmoid(outputs)
-
-            probabilities = probabilities.cpu().numpy()
-
-            predictions = probabilities > threshold
-
-            for sample_id, (pred, target, probability) in enumerate(
-                zip(predictions, masks, probabilities)
-            ):
-                pred = pred.squeeze()
-                target = target.squeeze()
-                probability = probability.squeeze()
-
-                metrics = calculate_metrics(pred, target)
-
-                metrics["thin_dice"] = calculate_thin_vessel_dice(pred, target)
-
-                results.append(metrics)
-
-                all_probabilities.extend(probability.flatten())
-                all_targets.extend(target.flatten())
-
-                if save_directory:
-                    output_path = os.path.join(
-                        save_directory,
-                        f"prediction_{index}_{sample_id}.png",
-                    )
-
-                    cv2.imwrite(
-                        output_path,
-                        (pred.astype(np.uint8) * 255),
-                    )
-
-    if len(results) == 0:
-        raise RuntimeError("evaluate_dataset received an empty loader.")
-
-    final_metrics = {}
-
-    for key in results[0]:
-        final_metrics[key] = float(
-            np.mean([item[key] for item in results])
-        )
-
-    try:
-        final_metrics["auc"] = float(
-            roc_auc_score(all_targets, all_probabilities)
-        )
-    except ValueError:
-        final_metrics["auc"] = 0.0
-
-    return final_metrics
-
-
-# ============================================================
-# SAVE RESULTS
-# ============================================================
-
-def save_results(results, path):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w") as file:
-        yaml.dump(results, file, sort_keys=False)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    config = load_config("config.yaml")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    print("Evaluation device:", device)
-
-    # --------------------------------------------------------
-    # RESOLUTION -- must match what training actually validated at
-    # --------------------------------------------------------
-    #
-    # preprocessing.image_size is only correct when patch_training is
-    # disabled. With patch training enabled (as in the current
-    # config), the resolution actually used for whole-image
-    # validation during training is patch_training.model_input_size.
-    # Evaluating at the wrong resolution silently produces a
-    # different, non-comparable number.
-
-    patch_config = config.get("patch_training", {})
-
-    if bool(patch_config.get("enabled", False)):
-        image_size = int(
-            patch_config.get(
-                "model_input_size",
-                config["preprocessing"]["image_size"]["height"],
-            )
-        )
-        print(f"patch_training.enabled=true -> evaluating at model_input_size={image_size}")
-    else:
-        image_size = int(config["preprocessing"]["image_size"]["height"])
-        print(f"patch_training.enabled=false -> evaluating at preprocessing.image_size={image_size}")
-
-    threshold = float(config.get("evaluation", {}).get("threshold", 0.5))
-
-    # --------------------------------------------------------
-    # CHECKPOINT -- read from config, not a hardcoded relative path
-    # --------------------------------------------------------
-
-    checkpoint_directory = Path(config["checkpoint"]["directory"])
-
-    checkpoint_path = checkpoint_directory / config["checkpoint"].get(
-        "best_model_name", "best_model.pth"
-    )
-
-    model = load_model(checkpoint_path, device, config)
-
-    experiment_output_dir = Path(
-        config.get("experiment", {}).get("output_directory", "./experiments")
-    )
-
-    all_results = {}
-
-    # --------------------------------------------------------
-    # 1. INTERNAL VALIDATION SPLIT (two methodologies, both cross-checks)
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 60)
-    print("Evaluating DRIVE_internal_validation_grid_patches")
-    print("(SAME methodology as your training log's 'Validation Dice':")
-    print(" deterministic overlapping grid patches, not whole images.")
-    print(" Use this to confirm evaluate.py reproduces train.py's number.")
-    print(" NOT a fair literature comparison -- used for checkpoint selection.)")
-    print("=" * 60)
-
-    if bool(patch_config.get("enabled", False)):
-        grid_validation_loader = build_internal_validation_loader_grid_patches(
-            config=config,
-        )
-
-        all_results["DRIVE_internal_validation_grid_patches"] = evaluate_dataset(
-            model,
-            grid_validation_loader,
-            device,
-            threshold=threshold,
-            save_directory=None,
-        )
-    else:
-        print("patch_training.enabled=false -- skipping, no grid patches were used in training.")
-
-    print("\n" + "=" * 60)
-    print("Evaluating DRIVE_internal_validation (whole-image)")
-    print("(literature-style metric: one Dice per whole image, then averaged.")
-    print(" Still the SAME potentially-leaky split as above until")
-    print(" DRIVE_train/DRIVE_test separation is confirmed -- see warning below.")
-    print(" NOT a fair literature comparison, cross-check only)")
-    print("=" * 60)
-
-    internal_validation_loader = build_internal_validation_loader_whole_image(
-        config=config,
-        image_size=image_size,
-    )
-
-    all_results["DRIVE_internal_validation"] = evaluate_dataset(
-        model,
-        internal_validation_loader,
-        device,
-        threshold=threshold,
-        save_directory=str(
-            experiment_output_dir / "predictions" / "DRIVE_internal_validation"
-        ),
-    )
-
-    all_results["DRIVE_internal_validation_TTA"] = evaluate_dataset(
-        model,
-        internal_validation_loader,
-        device,
-        threshold=threshold,
-        save_directory=None,
-        use_tta=True,
-    )
-
-    # Tune the binarization threshold on validation ONLY, using TTA
-    # predictions (since that is what will actually be used on
-    # DRIVE_test below). Never call sweep_threshold on DRIVE_test.
-    tuned_threshold = sweep_threshold(
-        model,
-        internal_validation_loader,
-        device,
-        use_tta=True,
-    )
-
-    # --------------------------------------------------------
-    # 2. TRUE HELD-OUT DRIVE TEST SET (the number that matters)
-    # --------------------------------------------------------
-
-    test_dataset_config = config["dataset"].get("test_dataset")
-
-    if test_dataset_config is None:
-        print(
-            "\nWARNING: config.yaml has no dataset.test_dataset entry. "
-            "Skipping the official DRIVE test-set evaluation -- this "
-            "means you currently have NO number comparable to "
-            "published DRIVE baselines. Re-run the corrected "
-            "prepare_datasets.py (DRIVE_train/DRIVE_test kept "
-            "separate) and add dataset.test_dataset to config.yaml."
-        )
-    else:
-        print("\n" + "=" * 60)
-        print("Evaluating DRIVE_test (official held-out set)")
-        print("=" * 60)
-
-        test_loader = build_test_loader(
-            image_dir=test_dataset_config["image_dir"],
-            mask_dir=test_dataset_config["mask_dir"],
-            image_size=image_size,
-            clahe=bool(config["preprocessing"]["clahe"].get("enabled", True)),
-        )
-
-        all_results["DRIVE_test"] = evaluate_dataset(
-            model,
-            test_loader,
-            device,
-            threshold=threshold,
-            save_directory=str(experiment_output_dir / "predictions" / "DRIVE_test"),
-        )
-
-        all_results["DRIVE_test_TTA"] = evaluate_dataset(
-            model,
-            test_loader,
-            device,
-            threshold=threshold,
-            save_directory=None,
-            use_tta=True,
-        )
-
-        all_results["DRIVE_test_TTA_tuned_threshold"] = evaluate_dataset(
-            model,
-            test_loader,
-            device,
-            threshold=tuned_threshold,
-            save_directory=str(
-                experiment_output_dir / "predictions" / "DRIVE_test_TTA_tuned_threshold"
-            ),
-            use_tta=True,
-        )
-
-    # --------------------------------------------------------
-    # 3. CROSS-DATASET GENERALIZATION
-    # --------------------------------------------------------
-
-    external_datasets = config["dataset"].get("external_datasets", {})
-
-    if external_datasets:
-        cross_dataset_loaders = build_cross_dataset_loaders(
-            datasets_config=external_datasets,
-            image_size=image_size,
-            clahe=bool(config["preprocessing"]["clahe"].get("enabled", True)),
-        )
-
-        for name, loader in cross_dataset_loaders.items():
-            print("\n" + "=" * 60)
-            print(f"Evaluating {name} (cross-dataset generalization)")
-            print("=" * 60)
-
-            all_results[name] = evaluate_dataset(
-                model,
-                loader,
-                device,
-                threshold=threshold,
-                save_directory=str(experiment_output_dir / "predictions" / name),
-            )
-@torch.no_grad()
-def evaluate_reconstructed_grid_patches(
-    model,
-    config,
-    device,
-    threshold=0.5,
-):
-    """
-    Whole-image evaluation using deterministic grid patches.
-
-    This reconstructs full retinal predictions from the same
-    GridPatchRetinalDataset used during validation.
-
-    This is different from:
-    - patch Dice validation
-    - direct whole-image resizing
-
-    It evaluates the model in the distribution it was trained on.
-    """
-
-    patch_config = config.get(
-        "patch_training",
-        {}
-    )
-
-    if not bool(
-        patch_config.get(
-            "enabled",
-            False
-        )
-    ):
-        raise ValueError(
-            "Patch training must be enabled "
-            "for reconstructed evaluation."
-        )
-
-    validation_pairs = _reconstruct_validation_pairs(
-        config
-    )
-
-    patch_size = int(
-        patch_config.get(
-            "patch_size",
-            256
-        )
-    )
-
-    model_input_size = int(
-        patch_config.get(
-            "model_input_size",
-            256
-        )
-    )
-
+    evaluation = config.get("evaluation", {})
+    reconstruction = evaluation.get("reconstruction", {})
+    dataloader = config.get("dataloader", {})
+
+    model_input_size = int(patch_config.get("model_input_size", 256))
+    patch_size = int(patch_config.get("patch_size", model_input_size))
     stride = int(
-        patch_config.get(
-            "validation_stride",
-            patch_size // 2
+        reconstruction.get(
+            "stride",
+            patch_config.get("validation_stride", max(1, patch_size // 2)),
         )
     )
 
+    if patch_size < 1 or model_input_size < 1 or stride < 1:
+        raise ValueError(
+            "patch_size, model_input_size, and reconstruction stride "
+            "must all be positive."
+        )
 
-    dataset = GridPatchRetinalDataset(
-        samples=validation_pairs,
+    if stride > patch_size:
+        raise ValueError(
+            "Reconstruction stride cannot exceed patch_size because that "
+            "would leave uncovered image regions."
+        )
+
+    fusion_mode = str(
+        reconstruction.get("fusion_mode", "hann")
+    ).strip().lower()
+
+    if fusion_mode not in {"hann", "uniform"}:
+        raise ValueError(
+            "evaluation.reconstruction.fusion_mode must be hann or uniform."
+        )
+
+    minimum_weight = float(reconstruction.get("minimum_weight", 0.05))
+
+    if not 0.0 < minimum_weight <= 1.0:
+        raise ValueError(
+            "evaluation.reconstruction.minimum_weight must lie in (0, 1]."
+        )
+
+    return ReconstructionSettings(
         patch_size=patch_size,
         model_input_size=model_input_size,
         stride=stride,
-        transform=get_validation_transform(
-            image_size=model_input_size
-        ),
+        batch_size=int(reconstruction.get("batch_size", 1)),
+        num_workers=int(dataloader.get("num_workers", 0)),
+        pin_memory=bool(dataloader.get("pin_memory", True)),
+        fusion_mode=fusion_mode,
+        minimum_weight=minimum_weight,
         clahe=bool(
-            config["preprocessing"]["clahe"].get(
-                "enabled",
-                True
-            )
+            config.get("preprocessing", {})
+            .get("clahe", {})
+            .get("enabled", True)
         ),
-        include_empty_patches=True,
-        minimum_vessel_fraction=0.0,
-    )
-
-
-    loader = create_dataloader(
-        dataset=dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        persistent_workers=False,
-        drop_last=False,
         seed=int(
             config["dataset"].get(
                 "split_seed",
-                config["seed"]["value"]
+                config["seed"]["value"],
             )
         ),
     )
 
 
+def create_fusion_window(
+    height: int,
+    width: int,
+    mode: str,
+    minimum_weight: float,
+) -> np.ndarray:
+    """Create a uniform or positive-floor 2-D Hann fusion window."""
+
+    if mode == "uniform":
+        return np.ones((height, width), dtype=np.float32)
+
+    vertical = (
+        np.hanning(height).astype(np.float32)
+        if height > 1
+        else np.ones(1, dtype=np.float32)
+    )
+    horizontal = (
+        np.hanning(width).astype(np.float32)
+        if width > 1
+        else np.ones(1, dtype=np.float32)
+    )
+
+    window = np.outer(vertical, horizontal).astype(np.float32)
+    maximum = float(window.max())
+
+    if maximum <= 0.0:
+        return np.ones((height, width), dtype=np.float32)
+
+    window /= maximum
+    return np.maximum(window, minimum_weight).astype(np.float32)
+
+
+def build_reconstruction_dataset(
+    samples: Sequence[SamplePair],
+    settings: ReconstructionSettings,
+) -> GridPatchRetinalDataset:
+    """Create a complete deterministic patch grid for native-resolution inference."""
+
+    return GridPatchRetinalDataset(
+        samples=samples,
+        patch_size=settings.patch_size,
+        model_input_size=settings.model_input_size,
+        stride=settings.stride,
+        transform=get_validation_transform(
+            image_size=settings.model_input_size
+        ),
+        clahe=settings.clahe,
+        include_empty_patches=True,
+        minimum_vessel_fraction=0.0,
+       
+    )
+
+
+# ============================================================
+# PATCH INFERENCE AND NATIVE-RESOLUTION RECONSTRUCTION
+# ============================================================
+
+
+@torch.inference_mode()
+def reconstruct_probability_maps(
+    model: torch.nn.Module,
+    samples: Sequence[SamplePair],
+    settings: ReconstructionSettings,
+    device: torch.device,
+    description: str,
+) -> Tuple[
+    Dict[int, np.ndarray],
+    Dict[int, np.ndarray],
+    Dict[int, np.ndarray],
+]:
+    """
+    Reconstruct one probability map per source image.
+
+    The network output is resized back to the original extracted patch size
+    before placement. This is essential when patch_size != model_input_size.
+    """
+
+    dataset = build_reconstruction_dataset(samples, settings)
+
+    loader = create_dataloader(
+        dataset=dataset,
+        batch_size=settings.batch_size,
+        shuffle=False,
+        num_workers=settings.num_workers,
+        pin_memory=settings.pin_memory,
+        persistent_workers=False,
+        drop_last=False,
+        seed=settings.seed,
+    )
+
+    patch_height = int(dataset.patch_height)
+    patch_width = int(dataset.patch_width)
+
+    fusion_window = create_fusion_window(
+        height=patch_height,
+        width=patch_width,
+        mode=settings.fusion_mode,
+        minimum_weight=settings.minimum_weight,
+    )
+
+    targets: Dict[int, np.ndarray] = {}
+    weighted_sums: Dict[int, np.ndarray] = {}
+    weight_sums: Dict[int, np.ndarray] = {}
+
+    for image_index, (_, mask_path) in enumerate(dataset.samples):
+        target = load_binary_mask(mask_path).astype(np.uint8)
+        height, width = target.shape
+
+        targets[image_index] = target
+        weighted_sums[image_index] = np.zeros(
+            (height, width),
+            dtype=np.float32,
+        )
+        weight_sums[image_index] = np.zeros(
+            (height, width),
+            dtype=np.float32,
+        )
+
     model.eval()
 
+    for batch in tqdm(loader, desc=description):
+        images = batch["image"].to(device, non_blocking=True)
 
-    reconstructed = {}
-    targets = {}
+        with autocast(
+            device_type=device.type,
+            enabled=device.type == "cuda",
+        ):
+            logits = get_main_output(model(images))
+            probabilities = torch.sigmoid(logits)
 
-
-    for batch in tqdm(
-        loader,
-        desc="Reconstructing validation images",
-    ):
-
-        images = batch["image"].to(
-            device,
-            non_blocking=True,
-        )
-
-        outputs = torch.sigmoid(
-            model(images)
-        )
-
-
-        output = outputs.squeeze().cpu().numpy()
-
-
-        image_index = int(
-            batch["source_image_index"].item()
-        )
-
-        top = int(
-            batch["top"].item()
-        )
-
-        left = int(
-            batch["left"].item()
-        )
-
-
-        if image_index not in reconstructed:
-
-            height = (
-                validation_pairs[image_index][1]
+        if probabilities.shape[-2:] != (patch_height, patch_width):
+            probabilities = F.interpolate(
+                probabilities.float(),
+                size=(patch_height, patch_width),
+                mode="bilinear",
+                align_corners=False,
             )
 
-            mask = load_binary_mask(
-                height
+        probabilities_np = (
+            probabilities.float().cpu().numpy()[:, 0]
+        )
+
+        source_indices = batch["source_image_index"]
+        top_values = batch["top"]
+        left_values = batch["left"]
+
+        for batch_index, patch_probability in enumerate(probabilities_np):
+            source_index = int(source_indices[batch_index].item())
+            top = int(top_values[batch_index].item())
+            left = int(left_values[batch_index].item())
+
+            target_height, target_width = targets[source_index].shape
+            bottom = min(top + patch_height, target_height)
+            right = min(left + patch_width, target_width)
+
+            valid_height = bottom - top
+            valid_width = right - left
+
+            if valid_height <= 0 or valid_width <= 0:
+                raise RuntimeError(
+                    f"Patch at top={top}, left={left} lies outside "
+                    f"source image {source_index}."
+                )
+
+            valid_probability = patch_probability[
+                :valid_height,
+                :valid_width,
+            ]
+            valid_weight = fusion_window[
+                :valid_height,
+                :valid_width,
+            ]
+
+            weighted_sums[source_index][top:bottom, left:right] += (
+                valid_probability * valid_weight
+            )
+            weight_sums[source_index][top:bottom, left:right] += valid_weight
+
+    reconstructed: Dict[int, np.ndarray] = {}
+
+    for image_index in sorted(targets):
+        weight_sum = weight_sums[image_index]
+
+        if np.any(weight_sum <= 0.0):
+            uncovered_pixels = int(np.sum(weight_sum <= 0.0))
+            raise RuntimeError(
+                f"Reconstruction left {uncovered_pixels} uncovered pixel(s) "
+                f"in source image {image_index}. Check stride and patch_size."
             )
 
-            h, w = mask.shape
+        reconstructed[image_index] = (
+            weighted_sums[image_index] / weight_sum
+        ).astype(np.float32)
+
+    return reconstructed, targets, weight_sums
 
 
-            reconstructed[image_index] = {
-                "prediction":
-                    np.zeros(
-                        (h,w),
-                        dtype=np.float32
-                    ),
+# ============================================================
+# THRESHOLD SELECTION AND METRICS
+# ============================================================
 
-                "count":
-                    np.zeros(
-                        (h,w),
-                        dtype=np.float32
-                    ),
+
+def threshold_candidates(
+    config: Mapping[str, Any],
+) -> np.ndarray:
+    """Build a configurable threshold grid; default is 0.20 to 0.80 by 0.01."""
+
+    threshold_config = (
+        config.get("evaluation", {}).get("threshold_sweep", {})
+    )
+
+    start = float(threshold_config.get("start", 0.20))
+    stop = float(threshold_config.get("stop", 0.96))
+    step = float(threshold_config.get("step", 0.01))
+
+    if not 0.0 <= start < stop <= 1.0:
+        raise ValueError(
+            "Threshold sweep must satisfy 0 <= start < stop <= 1."
+        )
+
+    if step <= 0.0:
+        raise ValueError("Threshold sweep step must be positive.")
+
+    number = int(round((stop - start) / step))
+    candidates = start + np.arange(number + 1, dtype=np.float64) * step
+    candidates = candidates[candidates <= stop + 1e-10]
+
+    return np.round(candidates, 6)
+
+
+def select_validation_threshold(
+    reconstructed: Mapping[int, np.ndarray],
+    targets: Mapping[int, np.ndarray],
+    candidates: Iterable[float],
+) -> Tuple[float, float, Dict[float, float]]:
+    """
+    Select the threshold maximizing macro image-level Dice.
+
+    When several thresholds are numerically tied, select the one closest to
+    0.5, then the lower one. This deterministic tie-break avoids arbitrary
+    dependence on candidate ordering.
+    """
+
+    scores: Dict[float, float] = {}
+
+    print("\nReconstructed validation threshold sweep:")
+
+    for threshold in candidates:
+        threshold = float(threshold)
+
+        dice_values = [
+            float(
+                calculate_metrics(
+                    prediction=reconstructed[index] > threshold,
+                    target=targets[index],
+                )["dice"]
+            )
+            for index in sorted(reconstructed)
+        ]
+
+        mean_dice = float(np.mean(dice_values))
+        scores[threshold] = mean_dice
+        print(f"  threshold={threshold:.2f} -> Dice={mean_dice:.4f}")
+
+    if not scores:
+        raise RuntimeError("Threshold sweep produced no candidates.")
+
+    best_dice = max(scores.values())
+    tolerance = 1e-12
+
+    tied_thresholds = [
+        threshold
+        for threshold, dice in scores.items()
+        if abs(dice - best_dice) <= tolerance
+    ]
+
+    best_threshold = min(
+        tied_thresholds,
+        key=lambda value: (abs(value - 0.5), value),
+    )
+
+    print(
+        "\nSelected validation threshold:",
+        f"{best_threshold:.2f}",
+        f"(reconstructed validation Dice={best_dice:.4f})",
+    )
+
+    return float(best_threshold), float(best_dice), scores
+
+
+def summarize_reconstructed_dataset(
+    dataset_name: str,
+    samples: Sequence[SamplePair],
+    reconstructed: Mapping[int, np.ndarray],
+    targets: Mapping[int, np.ndarray],
+    weight_sums: Mapping[int, np.ndarray],
+    threshold: float,
+    output_directory: Optional[Path],
+    save_outputs: bool,
+) -> Dict[str, Any]:
+    """Calculate macro image metrics and optionally save per-image outputs."""
+
+    case_metrics: List[Dict[str, float]] = []
+    case_records: List[Dict[str, Any]] = []
+
+    if save_outputs and output_directory is not None:
+        output_directory.mkdir(parents=True, exist_ok=True)
+
+    for image_index in sorted(reconstructed):
+        probability = reconstructed[image_index]
+        target = targets[image_index]
+        prediction = probability > float(threshold)
+
+        metrics = {
+            key: float(value)
+            for key, value in calculate_metrics(
+                prediction=prediction,
+                target=target,
+                probability=probability,
+            ).items()
+        }
+
+        image_path, mask_path = samples[image_index]
+
+        case_metrics.append(metrics)
+        case_records.append(
+            {
+                "index": int(image_index),
+                "image": str(image_path),
+                "mask": str(mask_path),
+                **metrics,
             }
+        )
 
-            targets[image_index] = mask
+        if save_outputs and output_directory is not None:
+            stem = f"{image_index:02d}_{Path(image_path).stem}"
 
-
-        prediction = reconstructed[image_index][
-            "prediction"
-        ]
-
-        count = reconstructed[image_index][
-            "count"
-        ]
-
-
-        ph, pw = output.shape
-
-
-        prediction[
-            top:top+ph,
-            left:left+pw
-        ] += output
-
-
-        count[
-            top:top+ph,
-            left:left+pw
-        ] += 1
-
-
-
-    results = []
-
-
-    for image_index in reconstructed:
-
-        prediction = (
-            reconstructed[image_index]["prediction"]
-            /
-            np.maximum(
-                reconstructed[image_index]["count"],
-                1e-8
+            cv2.imwrite(
+                str(output_directory / f"{stem}_prediction.png"),
+                prediction.astype(np.uint8) * 255,
             )
+            cv2.imwrite(
+                str(output_directory / f"{stem}_probability.png"),
+                np.clip(probability * 255.0, 0, 255).astype(np.uint8),
+            )
+            cv2.imwrite(
+                str(output_directory / f"{stem}_target.png"),
+                target.astype(np.uint8) * 255,
+            )
+
+            normalized_weight = weight_sums[image_index] / max(
+                float(weight_sums[image_index].max()),
+                1e-8,
+            )
+            cv2.imwrite(
+                str(output_directory / f"{stem}_weight_sum.png"),
+                np.clip(normalized_weight * 255.0, 0, 255).astype(np.uint8),
+            )
+
+    if not case_metrics:
+        raise RuntimeError(f"No cases were evaluated for {dataset_name}.")
+
+    metric_names = case_metrics[0].keys()
+    summary = {
+        metric_name: float(
+            np.mean([case[metric_name] for case in case_metrics])
+        )
+        for metric_name in metric_names
+    }
+
+    summary.update(
+        {
+            "threshold": float(threshold),
+            "images_evaluated": int(len(case_metrics)),
+            "aggregation": "macro_mean_over_whole_images",
+            "inference": "native_resolution_overlapping_patch_reconstruction",
+            "tta": False,
+            "cases": case_records,
+        }
+    )
+
+    return summary
+
+
+# ============================================================
+# EVALUATION ORCHESTRATION
+# ============================================================
+
+
+def evaluate_one_dataset(
+    dataset_name: str,
+    samples: Sequence[SamplePair],
+    model: torch.nn.Module,
+    settings: ReconstructionSettings,
+    device: torch.device,
+    threshold: float,
+    experiment_output_directory: Path,
+    save_outputs: bool,
+) -> Dict[str, Any]:
+    """Run the complete fixed-threshold reconstruction protocol."""
+
+    print("\n" + "=" * 72)
+    print(f"Evaluating {dataset_name}")
+    print(
+        f"patch={settings.patch_size}, input={settings.model_input_size}, "
+        f"stride={settings.stride}, fusion={settings.fusion_mode}, "
+        f"threshold={threshold:.2f}, TTA=False"
+    )
+    print("=" * 72)
+
+    reconstructed, targets, weight_sums = reconstruct_probability_maps(
+        model=model,
+        samples=samples,
+        settings=settings,
+        device=device,
+        description=f"Reconstructing {dataset_name}",
+    )
+
+    output_directory = (
+        experiment_output_directory / "predictions" / dataset_name
+    )
+
+    results = summarize_reconstructed_dataset(
+        dataset_name=dataset_name,
+        samples=samples,
+        reconstructed=reconstructed,
+        targets=targets,
+        weight_sums=weight_sums,
+        threshold=threshold,
+        output_directory=output_directory,
+        save_outputs=save_outputs,
+    )
+
+    print(
+        f"{dataset_name}: "
+        f"Dice={results['dice']:.4f}, "
+        f"Thin Dice={results.get('thin_vessel_dice', float('nan')):.4f}, "
+        f"Sensitivity={results['sensitivity']:.4f}, "
+        f"Specificity={results['specificity']:.4f}, "
+        f"Accuracy={results['accuracy']:.4f}, "
+        f"AUC={results.get('auc', float('nan')):.4f}"
+    )
+
+    return results
+
+
+def save_yaml(data: Mapping[str, Any], path: Path) -> None:
+    """Save nested results as readable YAML."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", encoding="utf-8") as file:
+        yaml.safe_dump(
+            dict(data),
+            file,
+            sort_keys=False,
+            allow_unicode=True,
         )
 
 
-        binary_prediction = (
-            prediction > threshold
-        )
+def main() -> None:
+    config = load_config("config.yaml")
 
-
-        metric = calculate_metrics(
-            binary_prediction,
-            targets[image_index]
-        )
-
-        results.append(metric)
-
-
-    mean_dice = np.mean(
-        [
-            item["dice"]
-            for item in results
-        ]
+    seed = int(config.get("seed", {}).get("value", 42))
+    deterministic = bool(
+        config.get("seed", {}).get("deterministic", True)
     )
+    seed_everything(seed, deterministic)
 
+    device = resolve_device(config)
+    settings = resolve_reconstruction_settings(config)
 
-    print("="*60)
+    print("\nEvaluation device:", device)
+    print("Standardized protocol: reconstruction=True, TTA=False")
     print(
-        "DRIVE reconstructed validation"
+        "Reconstruction settings:",
+        {
+            "patch_size": settings.patch_size,
+            "model_input_size": settings.model_input_size,
+            "stride": settings.stride,
+            "batch_size": settings.batch_size,
+            "num_workers": settings.num_workers,
+            "fusion_mode": settings.fusion_mode,
+            "minimum_weight": settings.minimum_weight,
+            "clahe": settings.clahe,
+        },
     )
-    print("="*60)
 
-    print(
-        f"Images evaluated: {len(results)}"
+    checkpoint_path = resolve_checkpoint_path(config)
+    output_directory = resolve_output_directory(config)
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    model, checkpoint = load_model(
+        checkpoint_path=checkpoint_path,
+        device=device,
+        config=config,
     )
 
-    print(
-        f"Dice: {mean_dice:.4f}"
-    )
+    evaluation_config = config.get("evaluation", {})
+    save_outputs = bool(evaluation_config.get("save_predictions", True))
 
-
-    return {
-        "dice": mean_dice,
-        "image_results": results,
+    all_results: Dict[str, Any] = {
+        "protocol": {
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_epoch": checkpoint.get("epoch"),
+            "checkpoint_patch_validation_best_dice": checkpoint.get("best_dice"),
+            "threshold_selection_dataset": "DRIVE_internal_validation",
+            "threshold_selection_metric": "macro whole-image Dice",
+            "test_time_augmentation": False,
+            "patch_size": settings.patch_size,
+            "model_input_size": settings.model_input_size,
+            "stride": settings.stride,
+            "fusion_mode": settings.fusion_mode,
+            "minimum_fusion_weight": settings.minimum_weight,
+            "clahe": settings.clahe,
+        }
     }
 
     # --------------------------------------------------------
-    # SAVE + REPORT
+    # 1. INTERNAL VALIDATION: RECONSTRUCT, THEN TUNE THRESHOLD
     # --------------------------------------------------------
 
-    results_path = experiment_output_dir / "evaluation_results.yaml"
+    validation_pairs = reconstruct_internal_validation_pairs(config)
 
-    save_results(all_results, str(results_path))
+    print("\n" + "=" * 72)
+    print("Reconstructing DRIVE_internal_validation for threshold selection")
+    print("This split is used only to select the operating threshold.")
+    print("=" * 72)
 
-    print("\n" + "=" * 60)
-    print("Evaluation Complete")
-    print("=" * 60)
+    validation_reconstructed, validation_targets, validation_weights = (
+        reconstruct_probability_maps(
+            model=model,
+            samples=validation_pairs,
+            settings=settings,
+            device=device,
+            description="Reconstructing DRIVE_internal_validation",
+        )
+    )
 
-    for dataset_name, metrics in all_results.items():
-        print("\n", dataset_name)
+    tuned_threshold, tuned_validation_dice, sweep_scores = (
+        select_validation_threshold(
+            reconstructed=validation_reconstructed,
+            targets=validation_targets,
+            candidates=threshold_candidates(config),
+        )
+    )
 
-        for key, value in metrics.items():
-            print(key, ":", round(value, 4))
+    validation_results = summarize_reconstructed_dataset(
+        dataset_name="DRIVE_internal_validation",
+        samples=validation_pairs,
+        reconstructed=validation_reconstructed,
+        targets=validation_targets,
+        weight_sums=validation_weights,
+        threshold=tuned_threshold,
+        output_directory=(
+            output_directory
+            / "predictions"
+            / "DRIVE_internal_validation"
+        ),
+        save_outputs=save_outputs,
+    )
 
-    print(f"\nResults saved to: {results_path}")
+    validation_results["threshold_sweep"] = {
+        f"{threshold:.6f}": float(dice)
+        for threshold, dice in sweep_scores.items()
+    }
+    validation_results["selected_threshold"] = tuned_threshold
+    validation_results["selected_threshold_dice"] = tuned_validation_dice
+
+    all_results["DRIVE_internal_validation"] = validation_results
+    all_results["protocol"]["frozen_threshold"] = tuned_threshold
+
+    # --------------------------------------------------------
+    # 2. OFFICIAL HELD-OUT DRIVE TEST
+    # --------------------------------------------------------
+
+    test_dataset_config = config.get("dataset", {}).get("test_dataset")
+
+    if test_dataset_config is None:
+        raise KeyError(
+            "config.yaml has no dataset.test_dataset entry. The official "
+            "DRIVE held-out evaluation cannot be performed."
+        )
+
+    drive_test_pairs = load_configured_pairs(
+        "DRIVE_test",
+        test_dataset_config,
+    )
+
+    all_results["DRIVE_test"] = evaluate_one_dataset(
+        dataset_name="DRIVE_test",
+        samples=drive_test_pairs,
+        model=model,
+        settings=settings,
+        device=device,
+        threshold=tuned_threshold,
+        experiment_output_directory=output_directory,
+        save_outputs=save_outputs,
+    )
+
+    # --------------------------------------------------------
+    # 3. ZERO-SHOT CROSS-DATASET GENERALIZATION
+    # --------------------------------------------------------
+
+    external_entries = normalize_external_dataset_entries(
+        config.get("dataset", {}).get("external_datasets", {})
+    )
+
+    for dataset_name, dataset_config in external_entries:
+        external_pairs = load_configured_pairs(
+            dataset_name,
+            dataset_config,
+        )
+
+        all_results[dataset_name] = evaluate_one_dataset(
+            dataset_name=dataset_name,
+            samples=external_pairs,
+            model=model,
+            settings=settings,
+            device=device,
+            threshold=tuned_threshold,
+            experiment_output_directory=output_directory,
+            save_outputs=save_outputs,
+        )
+
+    # --------------------------------------------------------
+    # SAVE AND REPORT
+    # --------------------------------------------------------
+
+    results_path = output_directory / "evaluation_results.yaml"
+    save_yaml(all_results, results_path)
+
+    print("\n" + "=" * 72)
+    print("Evaluation complete")
+    print("=" * 72)
+    print(f"Frozen validation-selected threshold: {tuned_threshold:.2f}")
+
+    for dataset_name, results in all_results.items():
+        if dataset_name == "protocol":
+            continue
+
+        print(
+            f"{dataset_name:35s} "
+            f"Dice={results['dice']:.4f} | "
+            f"Thin={results.get('thin_vessel_dice', float('nan')):.4f} | "
+            f"Se={results['sensitivity']:.4f} | "
+            f"Sp={results['specificity']:.4f} | "
+            f"Acc={results['accuracy']:.4f} | "
+            f"AUC={results.get('auc', float('nan')):.4f}"
+        )
+
+    print("\nResults saved to:", results_path.resolve())
 
 
 if __name__ == "__main__":

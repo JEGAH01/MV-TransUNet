@@ -40,6 +40,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Mapping
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -709,6 +711,215 @@ class SoftClDiceLoss(nn.Module):
 
 
 # ============================================================
+# VESSEL-WIDTH-ADAPTIVE WEIGHTING
+# ============================================================
+
+
+def compute_vessel_width_map(
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute local vessel width for every pixel of a binary mask.
+
+    Width is defined identically to the thin-vessel evaluation metric
+    already used in `src/metrics.py` (`extract_thin_vessels`):
+
+        width(x) = distance_transform(mask)(x) * 2
+
+    where the Euclidean distance transform gives the distance from each
+    foreground pixel to the nearest background pixel (an estimate of
+    local vessel radius), doubled to obtain an estimated diameter.
+    Background pixels receive a width of zero.
+
+    The transform runs on CPU per-sample via OpenCV, matching the
+    evaluation-side implementation exactly. The result carries no
+    gradient: it depends only on the fixed ground-truth mask, never on
+    the model's predictions.
+    """
+
+    if mask.ndim != 4 or mask.shape[1] != 1:
+        raise ValueError(
+            "mask must have shape [B, 1, H, W]."
+        )
+
+    batch_size = mask.shape[0]
+
+    mask_cpu = (
+        mask.detach()
+        .to(dtype=torch.float32)
+        .cpu()
+        .numpy()
+    )
+
+    width_maps = np.zeros_like(
+        mask_cpu,
+        dtype=np.float32,
+    )
+
+    for sample_index in range(batch_size):
+        binary_mask = (
+            mask_cpu[sample_index, 0] > 0.5
+        ).astype(np.uint8)
+
+        if binary_mask.sum() == 0:
+            continue
+
+        distance = cv2.distanceTransform(
+            binary_mask,
+            cv2.DIST_L2,
+            5,
+        )
+
+        width_maps[sample_index, 0] = (
+            distance * 2.0
+        )
+
+    return torch.from_numpy(width_maps).to(
+        device=mask.device,
+        dtype=mask.dtype,
+    )
+
+
+def compute_width_adaptive_weight_map(
+    mask_target: torch.Tensor,
+    reference_width: float = 3.0,
+    maximum_weight: float = 5.0,
+    epsilon: float = 1e-3,
+) -> torch.Tensor:
+    """
+    Build a per-pixel loss weight from local vessel caliber.
+
+    Background pixels receive unit weight. Foreground (vessel) pixels
+    are weighted as:
+
+        w(x) = clip(reference_width / max(width(x), epsilon), 1, maximum_weight)
+
+    `reference_width` matches the <=3-pixel thin-vessel threshold
+    already used for thin-vessel Dice, recall, and precision (see
+    `extract_thin_vessels` in `src/metrics.py`): a vessel pixel exactly
+    at this threshold receives unit weight, and narrower vessels are
+    up-weighted. `maximum_weight` caps the weight so that single-pixel
+    noise cannot dominate the gradient, mirroring the positive-weight
+    clamp already applied to the endpoint and junction losses
+    (`DynamicWeightedBCELoss`). No learned parameter is introduced: the
+    weight map is recomputed from the ground-truth mask on every call.
+    """
+
+    if reference_width <= 0.0:
+        raise ValueError(
+            "reference_width must be positive."
+        )
+
+    if maximum_weight < 1.0:
+        raise ValueError(
+            "maximum_weight must be at least 1.0."
+        )
+
+    width_map = compute_vessel_width_map(
+        mask_target
+    )
+
+    foreground = mask_target > 0.5
+
+    safe_width = torch.clamp(
+        width_map,
+        min=epsilon,
+    )
+
+    inverse_weight = torch.clamp(
+        reference_width / safe_width,
+        min=1.0,
+        max=maximum_weight,
+    )
+
+    return torch.where(
+        foreground,
+        inverse_weight,
+        torch.ones_like(mask_target),
+    )
+
+
+def weighted_bce_dice_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    weight_map: torch.Tensor,
+    bce_weight: float,
+    dice_weight: float,
+    dice_smooth: float = 1.0,
+    dice_epsilon: float = 1e-7,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    BCE plus Dice, both reweighted by a supplied per-pixel weight map.
+
+    Used to apply vessel-width-adaptive weighting to the main
+    segmentation loss and/or the skeleton loss while leaving the
+    unweighted `SegmentationCompositeLoss` (used for auxiliary
+    deep-supervision outputs and the retained original-head
+    consistency term) unchanged.
+    """
+
+    if weight_map.shape != targets.shape:
+        weight_map = F.interpolate(
+            weight_map,
+            size=targets.shape[-2:],
+            mode="nearest",
+        )
+
+    bce_loss = F.binary_cross_entropy_with_logits(
+        input=logits,
+        target=targets,
+        weight=weight_map,
+    )
+
+    probabilities = torch.sigmoid(logits)
+
+    probabilities_flat = probabilities.flatten(
+        start_dim=1
+    )
+    targets_flat = targets.flatten(
+        start_dim=1
+    )
+    weight_flat = weight_map.flatten(
+        start_dim=1
+    )
+
+    weighted_intersection = (
+        weight_flat
+        * probabilities_flat
+        * targets_flat
+    ).sum(dim=1)
+
+    weighted_denominator = (
+        weight_flat * probabilities_flat
+        + weight_flat * targets_flat
+    ).sum(dim=1)
+
+    dice_score = (
+        2.0 * weighted_intersection
+        + dice_smooth
+    ) / (
+        weighted_denominator
+        + dice_smooth
+        + dice_epsilon
+    )
+
+    dice_loss = (
+        1.0 - dice_score
+    ).mean()
+
+    total_loss = (
+        bce_weight * bce_loss
+        + dice_weight * dice_loss
+    )
+
+    return total_loss, bce_loss, dice_loss
+
+
+# ============================================================
 # COMPOSITE BINARY LOSSES
 # ============================================================
 
@@ -880,6 +1091,12 @@ class MVTransUNetTopologyLoss(nn.Module):
         node_focal_alpha: float = 0.75,
         node_focal_gamma: float = 2.0,
         cldice_iterations: int = 10,
+        use_width_adaptive_weighting: bool = False,
+        width_adaptive_apply_to_segmentation: bool = True,
+        width_adaptive_apply_to_skeleton: bool = True,
+        width_adaptive_reference_width: float = 3.0,
+        width_adaptive_maximum_weight: float = 5.0,
+        width_adaptive_epsilon: float = 1e-3,
         auxiliary_stage_weights: tuple[
             float,
             float,
@@ -932,6 +1149,35 @@ class MVTransUNetTopologyLoss(nn.Module):
 
         self.auxiliary_stage_weights = (
             auxiliary_stage_weights
+        )
+
+        if width_adaptive_reference_width <= 0.0:
+            raise ValueError(
+                "width_adaptive_reference_width must be positive."
+            )
+
+        if width_adaptive_maximum_weight < 1.0:
+            raise ValueError(
+                "width_adaptive_maximum_weight must be at least 1.0."
+            )
+
+        self.use_width_adaptive_weighting = (
+            use_width_adaptive_weighting
+        )
+        self.width_adaptive_apply_to_segmentation = (
+            width_adaptive_apply_to_segmentation
+        )
+        self.width_adaptive_apply_to_skeleton = (
+            width_adaptive_apply_to_skeleton
+        )
+        self.width_adaptive_reference_width = (
+            width_adaptive_reference_width
+        )
+        self.width_adaptive_maximum_weight = (
+            width_adaptive_maximum_weight
+        )
+        self.width_adaptive_epsilon = (
+            width_adaptive_epsilon
         )
 
         self.segmentation_loss = (
@@ -1108,6 +1354,21 @@ class MVTransUNetTopologyLoss(nn.Module):
             target_name="Mask target",
         )
 
+        width_adaptive_weight_map = None
+        if self.use_width_adaptive_weighting:
+            width_adaptive_weight_map = (
+                compute_width_adaptive_weight_map(
+                    mask_target=mask_target,
+                    reference_width=(
+                        self.width_adaptive_reference_width
+                    ),
+                    maximum_weight=(
+                        self.width_adaptive_maximum_weight
+                    ),
+                    epsilon=self.width_adaptive_epsilon,
+                )
+            )
+
         skeleton_target = prepare_binary_target(
             target=targets["skeleton"],
             reference=skeleton_logits,
@@ -1126,28 +1387,60 @@ class MVTransUNetTopologyLoss(nn.Module):
             target_name="Junction target",
         )
 
-        (
-            segmentation_loss,
-            segmentation_bce_loss,
-            segmentation_dice_loss,
-        ) = self.segmentation_loss(
-            segmentation_logits,
-            mask_target,
-        )
+        if (
+            width_adaptive_weight_map is not None
+            and self.width_adaptive_apply_to_segmentation
+        ):
+            (
+                segmentation_loss,
+                segmentation_bce_loss,
+                segmentation_dice_loss,
+            ) = weighted_bce_dice_loss(
+                logits=segmentation_logits,
+                targets=mask_target,
+                weight_map=width_adaptive_weight_map,
+                bce_weight=self.segmentation_loss.bce_weight,
+                dice_weight=self.segmentation_loss.dice_weight,
+            )
+        else:
+            (
+                segmentation_loss,
+                segmentation_bce_loss,
+                segmentation_dice_loss,
+            ) = self.segmentation_loss(
+                segmentation_logits,
+                mask_target,
+            )
 
         cldice_loss = self.cldice_loss(
             segmentation_logits,
             mask_target,
         )
 
-        (
-            skeleton_loss,
-            skeleton_bce_loss,
-            skeleton_dice_loss,
-        ) = self.skeleton_loss(
-            skeleton_logits,
-            skeleton_target,
-        )
+        if (
+            width_adaptive_weight_map is not None
+            and self.width_adaptive_apply_to_skeleton
+        ):
+            (
+                skeleton_loss,
+                skeleton_bce_loss,
+                skeleton_dice_loss,
+            ) = weighted_bce_dice_loss(
+                logits=skeleton_logits,
+                targets=skeleton_target,
+                weight_map=width_adaptive_weight_map,
+                bce_weight=self.skeleton_loss.bce_weight,
+                dice_weight=self.skeleton_loss.dice_weight,
+            )
+        else:
+            (
+                skeleton_loss,
+                skeleton_bce_loss,
+                skeleton_dice_loss,
+            ) = self.skeleton_loss(
+                skeleton_logits,
+                skeleton_target,
+            )
 
         (
             endpoint_loss,

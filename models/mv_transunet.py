@@ -35,6 +35,7 @@ Validation and inference output:
     B x 1 x H x W
 """
 
+from __future__ import annotations
 
 from typing import Dict, List, Union
 
@@ -98,6 +99,7 @@ class MVTransUNet(nn.Module):
         output_channels: int = 1,
         deep_supervision: bool = True,
         decoder_dropout_rate: float = 0.1,
+        vessel_attention_scale_conditioning: bool = False,
     ) -> None:
         super().__init__()
 
@@ -127,6 +129,9 @@ class MVTransUNet(nn.Module):
         self.output_channels = output_channels
         self.deep_supervision = deep_supervision
         self.decoder_dropout_rate = decoder_dropout_rate
+        self.vessel_attention_scale_conditioning = (
+            vessel_attention_scale_conditioning
+        )
 
         # ----------------------------------------------------
         # Hybrid ResNet50 + Vision Transformer encoder
@@ -144,6 +149,7 @@ class MVTransUNet(nn.Module):
         self.vessel_attention = VesselAttentionModule(
             channels=transformer_channels,
             reduction_ratio=vessel_reduction_ratio,
+            scale_conditioning=vessel_attention_scale_conditioning,
         )
 
         # ----------------------------------------------------
@@ -160,6 +166,7 @@ class MVTransUNet(nn.Module):
         self,
         x: torch.Tensor,
         return_auxiliary: bool = False,
+        scale_ratio: torch.Tensor | float | None = None,
     ) -> ModelOutput:
         """
         Run the complete MV-TransUNet forward pass.
@@ -173,6 +180,14 @@ class MVTransUNet(nn.Module):
                 Force auxiliary outputs to be returned when deep
                 supervision is enabled. This can be used for model
                 analysis during evaluation.
+
+            scale_ratio:
+                Optional per-sample scale-conditioning signal for the
+                Vessel Attention Module, with shape [B] (or a Python
+                float, broadcast to every sample in the batch). Ignored
+                unless the model was constructed with
+                vessel_attention_scale_conditioning=True, in which case
+                it defaults to 1.0 (no scale change) when omitted.
 
         Returns:
             Training with deep supervision:
@@ -238,8 +253,16 @@ class MVTransUNet(nn.Module):
         # Vessel attention
         # ----------------------------------------------------
 
+        if isinstance(scale_ratio, (int, float)):
+            scale_ratio = torch.full(
+                (transformer_feature.shape[0],),
+                float(scale_ratio),
+                device=transformer_feature.device,
+            )
+
         transformer_feature = self.vessel_attention(
-            transformer_feature
+            transformer_feature,
+            scale_ratio=scale_ratio,
         )
 
         # ----------------------------------------------------
@@ -269,6 +292,7 @@ def build_mv_transunet(
     output_channels: int = 1,
     deep_supervision: bool = True,
     decoder_dropout_rate: float = 0.1,
+    vessel_attention_scale_conditioning: bool = False,
 ) -> MVTransUNet:
     """
     Build an MV-TransUNet model instance.
@@ -281,6 +305,7 @@ def build_mv_transunet(
         output_channels=output_channels,
         deep_supervision=deep_supervision,
         decoder_dropout_rate=decoder_dropout_rate,
+        vessel_attention_scale_conditioning=vessel_attention_scale_conditioning,
     )
 
 
