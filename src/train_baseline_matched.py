@@ -34,6 +34,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from models.mv_transunet import MVTransUNet
+from models.topology_losses import (
+    compute_width_adaptive_weight_map,
+    weighted_bce_dice_loss,
+)
 from src.datasets import build_dataloaders, build_patch_dataloaders
 
 
@@ -85,7 +89,19 @@ class SoftDiceLoss(nn.Module):
 
 
 class MatchedBaselineLoss(nn.Module):
-    """BCE-Dice main loss plus topology-matched deep supervision."""
+    """BCE-Dice main loss plus topology-matched deep supervision.
+
+    Optionally applies vessel-width-adaptive per-pixel weighting to the
+    main segmentation loss only (auxiliary deep-supervision stages remain
+    unweighted). This reuses the same `compute_width_adaptive_weight_map`
+    and `weighted_bce_dice_loss` functions used by the topology model's
+    A8 configuration (`models/topology_losses.py`), so that the "Weighted
+    Baseline" ablation isolates the width-adaptive loss term from the
+    topology supervision (TFFM, skeleton/endpoint/junction heads) that
+    otherwise differs between the baseline and the full topology model.
+    Disabled by default (`use_width_adaptive_weighting=False`), which
+    reproduces the original unweighted baseline exactly.
+    """
 
     def __init__(
         self,
@@ -93,6 +109,10 @@ class MatchedBaselineLoss(nn.Module):
         dice_weight: float = 0.50,
         auxiliary_weight: float = 0.20,
         auxiliary_stage_weights: Sequence[float] = (0.25, 0.50, 0.75),
+        use_width_adaptive_weighting: bool = False,
+        width_adaptive_reference_width: float = 3.0,
+        width_adaptive_maximum_weight: float = 5.0,
+        width_adaptive_epsilon: float = 1e-3,
     ) -> None:
         super().__init__()
         if bce_weight < 0 or dice_weight < 0 or bce_weight + dice_weight <= 0:
@@ -103,6 +123,10 @@ class MatchedBaselineLoss(nn.Module):
             raise ValueError("At least one auxiliary stage weight is required.")
         if any(weight < 0 for weight in auxiliary_stage_weights):
             raise ValueError("Auxiliary stage weights must be non-negative.")
+        if width_adaptive_reference_width <= 0.0:
+            raise ValueError("width_adaptive_reference_width must be positive.")
+        if width_adaptive_maximum_weight < 1.0:
+            raise ValueError("width_adaptive_maximum_weight must be at least 1.0.")
 
         self.bce_weight = float(bce_weight)
         self.dice_weight = float(dice_weight)
@@ -110,6 +134,11 @@ class MatchedBaselineLoss(nn.Module):
         self.auxiliary_stage_weights = tuple(float(value) for value in auxiliary_stage_weights)
         self.bce = nn.BCEWithLogitsLoss()
         self.dice = SoftDiceLoss()
+
+        self.use_width_adaptive_weighting = bool(use_width_adaptive_weighting)
+        self.width_adaptive_reference_width = float(width_adaptive_reference_width)
+        self.width_adaptive_maximum_weight = float(width_adaptive_maximum_weight)
+        self.width_adaptive_epsilon = float(width_adaptive_epsilon)
 
     @staticmethod
     def _extract_outputs(outputs: object) -> Tuple[torch.Tensor, Sequence[torch.Tensor]]:
@@ -141,11 +170,37 @@ class MatchedBaselineLoss(nn.Module):
         combined = self.bce_weight * bce_loss + self.dice_weight * dice_loss
         return combined, bce_loss, dice_loss
 
+    def _weighted_main_segmentation_loss(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        matched_target = self._match_target(target, logits).to(dtype=logits.dtype)
+        weight_map = compute_width_adaptive_weight_map(
+            mask_target=matched_target,
+            reference_width=self.width_adaptive_reference_width,
+            maximum_weight=self.width_adaptive_maximum_weight,
+            epsilon=self.width_adaptive_epsilon,
+        )
+        combined, bce_loss, dice_loss = weighted_bce_dice_loss(
+            logits=logits,
+            targets=matched_target,
+            weight_map=weight_map,
+            bce_weight=self.bce_weight,
+            dice_weight=self.dice_weight,
+        )
+        return combined, bce_loss, dice_loss
+
     def forward(self, outputs: object, target: torch.Tensor) -> BaselineLossOutput:
         main_logits, auxiliary_outputs = self._extract_outputs(outputs)
-        main_loss, main_bce_loss, main_dice_loss = self._segmentation_loss(
-            main_logits, target
-        )
+        if self.use_width_adaptive_weighting:
+            main_loss, main_bce_loss, main_dice_loss = self._weighted_main_segmentation_loss(
+                main_logits, target
+            )
+        else:
+            main_loss, main_bce_loss, main_dice_loss = self._segmentation_loss(
+                main_logits, target
+            )
 
         auxiliary_loss = main_loss.new_zeros(())
         if auxiliary_outputs:
@@ -308,6 +363,18 @@ def build_criterion(config: Mapping) -> MatchedBaselineLoss:
         auxiliary_stage_weights=tuple(
             float(value)
             for value in loss.get("auxiliary_stage_weights", [0.25, 0.50, 0.75])
+        ),
+        use_width_adaptive_weighting=bool(
+            loss.get("use_width_adaptive_weighting", False)
+        ),
+        width_adaptive_reference_width=float(
+            loss.get("width_adaptive_reference_width", 3.0)
+        ),
+        width_adaptive_maximum_weight=float(
+            loss.get("width_adaptive_maximum_weight", 5.0)
+        ),
+        width_adaptive_epsilon=float(
+            loss.get("width_adaptive_epsilon", 1e-3)
         ),
     )
 

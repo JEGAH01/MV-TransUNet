@@ -87,3 +87,6 @@ analysis/
 
 # Editor config
 .vscode/
+
+# Manuscript drafts (kept locally, not versioned with the code)
+Claude outputs/
